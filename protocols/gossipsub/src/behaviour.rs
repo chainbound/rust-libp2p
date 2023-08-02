@@ -748,6 +748,121 @@ where
         Ok(msg_id)
     }
 
+    /// Publishes a message to our explicit peers.
+    pub fn publish_priority(
+        &mut self,
+        topic: impl Into<TopicHash>,
+        data: impl Into<Vec<u8>>,
+    ) -> Result<MessageId, PublishError> {
+        let data = data.into();
+        let topic = topic.into();
+
+        // Transform the data before building a raw_message.
+        let transformed_data = self
+            .data_transform
+            .outbound_transform(&topic, data.clone())?;
+
+        let raw_message = self.build_raw_message(topic, transformed_data)?;
+
+        // calculate the message id from the un-transformed data
+        let msg_id = self.config.message_id(&GossipsubMessage {
+            source: raw_message.source,
+            data, // the uncompressed form
+            sequence_number: raw_message.sequence_number,
+            topic: raw_message.topic.clone(),
+        });
+
+        let event = GossipsubRpc {
+            subscriptions: Vec::new(),
+            messages: vec![raw_message.clone()],
+            control_msgs: Vec::new(),
+        }
+        .into_protobuf();
+
+        // check that the size doesn't exceed the max transmission size
+        if event.encoded_len() > self.config.max_transmit_size() {
+            return Err(PublishError::MessageTooLarge);
+        }
+
+        // Check the if the message has been published before
+        if self.duplicate_cache.contains(&msg_id) {
+            // This message has already been seen. We don't re-publish messages that have already
+            // been published on the network.
+            warn!(
+                "Not publishing a message that has already been published. Msg-id {}",
+                msg_id
+            );
+            return Err(PublishError::Duplicate);
+        }
+
+        trace!("Publishing priority message: {:?}", msg_id);
+
+        let topic_hash = raw_message.topic;
+
+        // If we are not flood publishing forward the message to mesh peers.
+        // NOTE: we don't do this here.
+        // let mesh_peers_sent = !self.config.flood_publish()
+        //     && self.forward_msg(&msg_id, raw_message, None, HashSet::new())?;
+
+        let mut recipient_peers = HashSet::new();
+        if let Some(set) = self.topic_peers.get(&topic_hash) {
+            if self.config.flood_publish() {
+                // Forward to all peers above score and all explicit peers
+                recipient_peers.extend(
+                    set.iter()
+                        .filter(|p| {
+                            self.explicit_peers.contains(*p)
+                                || !self.score_below_threshold(p, |ts| ts.publish_threshold).0
+                        })
+                        .cloned(),
+                );
+            } else {
+                // Explicit peers
+                for peer in &self.explicit_peers {
+                    if set.contains(peer) {
+                        recipient_peers.insert(*peer);
+                    }
+                }
+            }
+        }
+
+        if recipient_peers.is_empty() {
+            return Err(PublishError::InsufficientPeers);
+        }
+
+        // NOTE: we don't cache here, because otherwise we would not send the
+        // message to our normal gossipsub peers after this
+        // self.duplicate_cache.insert(msg_id.clone());
+        // self.mcache.put(&msg_id, raw_message);
+
+        // If the message is anonymous or has a random author add it to the published message ids
+        // cache.
+        if let PublishConfig::RandomAuthor | PublishConfig::Anonymous = self.publish_config {
+            if !self.config.allow_self_origin() {
+                self.published_message_ids.insert(msg_id.clone());
+            }
+        }
+
+        // Send to peers we know are subscribed to the topic.
+        let msg_bytes = event.encoded_len();
+        for peer_id in recipient_peers.iter() {
+            trace!("Sending priority message to peer: {:?}", peer_id);
+            self.send_message(*peer_id, event.clone())?;
+
+            if let Some(m) = self.metrics.as_mut() {
+                m.msg_sent(&topic_hash, msg_bytes);
+            }
+        }
+
+        debug!(
+            "Published priority message: {:?} to {} peers",
+            &msg_id,
+            recipient_peers.len()
+        );
+
+        Ok(msg_id)
+    }
+
     /// This function should be called when [`GossipsubConfig::validate_messages()`] is `true` after
     /// the message got validated by the caller. Messages are stored in the ['Memcache'] and
     /// validation is expected to be fast enough that the messages should still exist in the cache.
