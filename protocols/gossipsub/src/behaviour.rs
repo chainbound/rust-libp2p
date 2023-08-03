@@ -31,7 +31,7 @@ use std::{
 };
 
 use futures::StreamExt;
-use log::{debug, error, trace, warn};
+use tracing::{debug, error, trace, warn};
 use prometheus_client::registry::Registry;
 use prost::Message;
 use rand::{seq::SliceRandom, thread_rng};
@@ -788,7 +788,7 @@ where
         if self.duplicate_cache.contains(&msg_id) {
             // This message has already been seen. We don't re-publish messages that have already
             // been published on the network.
-            warn!(
+            tracing::warn!(
                 "Not publishing a message that has already been published. Msg-id {}",
                 msg_id
             );
