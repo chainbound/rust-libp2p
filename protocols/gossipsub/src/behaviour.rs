@@ -31,10 +31,10 @@ use std::{
 };
 
 use futures::StreamExt;
-use tracing::{debug, error, trace, warn};
 use prometheus_client::registry::Registry;
 use prost::Message;
 use rand::{seq::SliceRandom, thread_rng};
+use tracing::{debug, error, trace, warn};
 
 use libp2p_core::{
     connection::ConnectionId, identity::Keypair, multiaddr::Protocol::Ip4,
@@ -784,16 +784,7 @@ where
             return Err(PublishError::MessageTooLarge);
         }
 
-        // Check the if the message has been published before
-        if self.duplicate_cache.contains(&msg_id) {
-            // This message has already been seen. We don't re-publish messages that have already
-            // been published on the network.
-            tracing::warn!(
-                "Not publishing a message that has already been published. Msg-id {}",
-                msg_id
-            );
-            return Err(PublishError::Duplicate);
-        }
+        // No duplication checks here
 
         trace!("Publishing priority message: {:?}", msg_id);
 
@@ -1835,6 +1826,7 @@ where
             return false;
         }
 
+        debug!("Message is valid");
         true
     }
 
@@ -1957,6 +1949,7 @@ where
 
         // forward the message to mesh peers, if no validation is required
         if !self.config.validate_messages() {
+            debug!("Forwarding message to mesh peers");
             if self
                 .forward_msg(
                     &msg_id,
