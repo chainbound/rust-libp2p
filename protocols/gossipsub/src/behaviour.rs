@@ -797,22 +797,10 @@ where
 
         let mut recipient_peers = HashSet::new();
         if let Some(set) = self.topic_peers.get(&topic_hash) {
-            if self.config.flood_publish() {
-                // Forward to all peers above score and all explicit peers
-                recipient_peers.extend(
-                    set.iter()
-                        .filter(|p| {
-                            self.explicit_peers.contains(*p)
-                                || !self.score_below_threshold(p, |ts| ts.publish_threshold).0
-                        })
-                        .cloned(),
-                );
-            } else {
-                // Explicit peers
-                for peer in &self.explicit_peers {
-                    if set.contains(peer) {
-                        recipient_peers.insert(*peer);
-                    }
+            // Explicit peers
+            for peer in &self.explicit_peers {
+                if set.contains(peer) {
+                    recipient_peers.insert(*peer);
                 }
             }
         }
