@@ -31,7 +31,6 @@ use std::{
 
 use futures::StreamExt;
 use futures_ticker::Ticker;
-use log::{debug, error, trace, warn};
 use prometheus_client::registry::Registry;
 use rand::{seq::SliceRandom, thread_rng};
 use tracing::{debug, error, trace, warn};
@@ -785,22 +784,23 @@ where
         let raw_message = self.build_raw_message(topic, transformed_data)?;
 
         // calculate the message id from the un-transformed data
-        let msg_id = self.config.message_id(&GossipsubMessage {
+        let msg_id = self.config.message_id(&Message {
             source: raw_message.source,
             data, // the uncompressed form
             sequence_number: raw_message.sequence_number,
             topic: raw_message.topic.clone(),
         });
 
-        let event = GossipsubRpc {
+        let event = Rpc {
             subscriptions: Vec::new(),
             messages: vec![raw_message.clone()],
             control_msgs: Vec::new(),
         }
         .into_protobuf();
 
+        let event_size = event.get_size();
         // check that the size doesn't exceed the max transmission size
-        if event.encoded_len() > self.config.max_transmit_size() {
+        if event_size > self.config.max_transmit_size() {
             return Err(PublishError::MessageTooLarge);
         }
 
@@ -809,11 +809,6 @@ where
         trace!("Publishing priority message: {:?}", msg_id);
 
         let topic_hash = raw_message.topic;
-
-        // If we are not flood publishing forward the message to mesh peers.
-        // NOTE: we don't do this here.
-        // let mesh_peers_sent = !self.config.flood_publish()
-        //     && self.forward_msg(&msg_id, raw_message, None, HashSet::new())?;
 
         let mut recipient_peers = HashSet::new();
         if let Some(set) = self.topic_peers.get(&topic_hash) {
@@ -829,11 +824,6 @@ where
             return Err(PublishError::InsufficientPeers);
         }
 
-        // NOTE: we don't cache here, because otherwise we would not send the
-        // message to our normal gossipsub peers after this
-        // self.duplicate_cache.insert(msg_id.clone());
-        // self.mcache.put(&msg_id, raw_message);
-
         // If the message is anonymous or has a random author add it to the published message ids
         // cache.
         if let PublishConfig::RandomAuthor | PublishConfig::Anonymous = self.publish_config {
@@ -843,13 +833,12 @@ where
         }
 
         // Send to peers we know are subscribed to the topic.
-        let msg_bytes = event.encoded_len();
         for peer_id in recipient_peers.iter() {
             trace!("Sending priority message to peer: {:?}", peer_id);
             self.send_message(*peer_id, event.clone())?;
 
             if let Some(m) = self.metrics.as_mut() {
-                m.msg_sent(&topic_hash, msg_bytes);
+                m.msg_sent(&topic_hash, event_size);
             }
         }
 
