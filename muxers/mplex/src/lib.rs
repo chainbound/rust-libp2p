@@ -18,6 +18,10 @@
 // FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 // DEALINGS IN THE SOFTWARE.
 
+//! Implementation of the Stream Multiplexer [Mplex](https://github.com/libp2p/specs/blob/master/mplex/README.md) protocol.
+
+#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
+
 mod codec;
 mod config;
 mod io;
@@ -33,7 +37,7 @@ use parking_lot::Mutex;
 use std::{cmp, iter, pin::Pin, sync::Arc, task::Context, task::Poll};
 
 impl UpgradeInfo for MplexConfig {
-    type Info = &'static [u8];
+    type Info = &'static str;
     type InfoIter = iter::Once<Self::Info>;
 
     fn protocol_info(&self) -> Self::InfoIter {

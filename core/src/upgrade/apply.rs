@@ -18,18 +18,18 @@
 // FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 // DEALINGS IN THE SOFTWARE.
 
-use crate::upgrade::{InboundUpgrade, OutboundUpgrade, ProtocolName, UpgradeError};
+use crate::upgrade::{InboundUpgrade, OutboundUpgrade, UpgradeError};
 use crate::{connection::ConnectedPoint, Negotiated};
 use futures::{future::Either, prelude::*};
 use log::debug;
 use multistream_select::{self, DialerSelectFuture, ListenerSelectFuture};
-use std::{iter, mem, pin::Pin, task::Context, task::Poll};
+use std::{mem, pin::Pin, task::Context, task::Poll};
 
-pub use multistream_select::Version;
+pub(crate) use multistream_select::Version;
 
 // TODO: Still needed?
 /// Applies an upgrade to the inbound and outbound direction of a connection or substream.
-pub fn apply<C, U>(
+pub(crate) fn apply<C, U>(
     conn: C,
     up: U,
     cp: ConnectedPoint,
@@ -48,38 +48,28 @@ where
 }
 
 /// Tries to perform an upgrade on an inbound connection or substream.
-pub fn apply_inbound<C, U>(conn: C, up: U) -> InboundUpgradeApply<C, U>
+pub(crate) fn apply_inbound<C, U>(conn: C, up: U) -> InboundUpgradeApply<C, U>
 where
     C: AsyncRead + AsyncWrite + Unpin,
     U: InboundUpgrade<Negotiated<C>>,
 {
-    let iter = up
-        .protocol_info()
-        .into_iter()
-        .map(NameWrap as fn(_) -> NameWrap<_>);
-    let future = multistream_select::listener_select_proto(conn, iter);
     InboundUpgradeApply {
         inner: InboundUpgradeApplyState::Init {
-            future,
+            future: multistream_select::listener_select_proto(conn, up.protocol_info().into_iter()),
             upgrade: up,
         },
     }
 }
 
 /// Tries to perform an upgrade on an outbound connection or substream.
-pub fn apply_outbound<C, U>(conn: C, up: U, v: Version) -> OutboundUpgradeApply<C, U>
+pub(crate) fn apply_outbound<C, U>(conn: C, up: U, v: Version) -> OutboundUpgradeApply<C, U>
 where
     C: AsyncRead + AsyncWrite + Unpin,
     U: OutboundUpgrade<Negotiated<C>>,
 {
-    let iter = up
-        .protocol_info()
-        .into_iter()
-        .map(NameWrap as fn(_) -> NameWrap<_>);
-    let future = multistream_select::dialer_select_proto(conn, iter, v);
     OutboundUpgradeApply {
         inner: OutboundUpgradeApplyState::Init {
-            future,
+            future: multistream_select::dialer_select_proto(conn, up.protocol_info(), v),
             upgrade: up,
         },
     }
@@ -94,17 +84,19 @@ where
     inner: InboundUpgradeApplyState<C, U>,
 }
 
+#[allow(clippy::large_enum_variant)]
 enum InboundUpgradeApplyState<C, U>
 where
     C: AsyncRead + AsyncWrite + Unpin,
     U: InboundUpgrade<Negotiated<C>>,
 {
     Init {
-        future: ListenerSelectFuture<C, NameWrap<U::Info>>,
+        future: ListenerSelectFuture<C, U::Info>,
         upgrade: U,
     },
     Upgrade {
         future: Pin<Box<U::Future>>,
+        name: String,
     },
     Undefined,
 }
@@ -138,21 +130,22 @@ where
                         }
                     };
                     self.inner = InboundUpgradeApplyState::Upgrade {
-                        future: Box::pin(upgrade.upgrade_inbound(io, info.0)),
+                        future: Box::pin(upgrade.upgrade_inbound(io, info.clone())),
+                        name: info.as_ref().to_owned(),
                     };
                 }
-                InboundUpgradeApplyState::Upgrade { mut future } => {
+                InboundUpgradeApplyState::Upgrade { mut future, name } => {
                     match Future::poll(Pin::new(&mut future), cx) {
                         Poll::Pending => {
-                            self.inner = InboundUpgradeApplyState::Upgrade { future };
+                            self.inner = InboundUpgradeApplyState::Upgrade { future, name };
                             return Poll::Pending;
                         }
                         Poll::Ready(Ok(x)) => {
-                            debug!("Successfully applied negotiated protocol");
+                            log::trace!("Upgraded inbound stream to {name}");
                             return Poll::Ready(Ok(x));
                         }
                         Poll::Ready(Err(e)) => {
-                            debug!("Failed to apply negotiated protocol");
+                            debug!("Failed to upgrade inbound stream to {name}");
                             return Poll::Ready(Err(UpgradeError::Apply(e)));
                         }
                     }
@@ -180,11 +173,12 @@ where
     U: OutboundUpgrade<Negotiated<C>>,
 {
     Init {
-        future: DialerSelectFuture<C, NameWrapIter<<U::InfoIter as IntoIterator>::IntoIter>>,
+        future: DialerSelectFuture<C, <U::InfoIter as IntoIterator>::IntoIter>,
         upgrade: U,
     },
     Upgrade {
         future: Pin<Box<U::Future>>,
+        name: String,
     },
     Undefined,
 }
@@ -218,21 +212,22 @@ where
                         }
                     };
                     self.inner = OutboundUpgradeApplyState::Upgrade {
-                        future: Box::pin(upgrade.upgrade_outbound(connection, info.0)),
+                        future: Box::pin(upgrade.upgrade_outbound(connection, info.clone())),
+                        name: info.as_ref().to_owned(),
                     };
                 }
-                OutboundUpgradeApplyState::Upgrade { mut future } => {
+                OutboundUpgradeApplyState::Upgrade { mut future, name } => {
                     match Future::poll(Pin::new(&mut future), cx) {
                         Poll::Pending => {
-                            self.inner = OutboundUpgradeApplyState::Upgrade { future };
+                            self.inner = OutboundUpgradeApplyState::Upgrade { future, name };
                             return Poll::Pending;
                         }
                         Poll::Ready(Ok(x)) => {
-                            debug!("Successfully applied negotiated protocol");
+                            log::trace!("Upgraded outbound stream to {name}",);
                             return Poll::Ready(Ok(x));
                         }
                         Poll::Ready(Err(e)) => {
-                            debug!("Failed to apply negotiated protocol");
+                            debug!("Failed to upgrade outbound stream to {name}",);
                             return Poll::Ready(Err(UpgradeError::Apply(e)));
                         }
                     }
@@ -242,17 +237,5 @@ where
                 }
             }
         }
-    }
-}
-
-type NameWrapIter<I> = iter::Map<I, fn(<I as Iterator>::Item) -> NameWrap<<I as Iterator>::Item>>;
-
-/// Wrapper type to expose an `AsRef<[u8]>` impl for all types implementing `ProtocolName`.
-#[derive(Clone)]
-struct NameWrap<N>(N);
-
-impl<N: ProtocolName> AsRef<[u8]> for NameWrap<N> {
-    fn as_ref(&self) -> &[u8] {
-        self.0.protocol_name()
     }
 }

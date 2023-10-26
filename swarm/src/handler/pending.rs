@@ -20,14 +20,10 @@
 // DEALINGS IN THE SOFTWARE.
 
 use crate::handler::{
-    ConnectionHandler, ConnectionHandlerEvent, ConnectionHandlerUpgrErr, KeepAlive,
-    SubstreamProtocol,
+    ConnectionEvent, ConnectionHandler, ConnectionHandlerEvent, FullyNegotiatedInbound,
+    FullyNegotiatedOutbound, KeepAlive, SubstreamProtocol,
 };
-use crate::NegotiatedSubstream;
-use libp2p_core::{
-    upgrade::{InboundUpgrade, OutboundUpgrade, PendingUpgrade},
-    Multiaddr,
-};
+use libp2p_core::upgrade::PendingUpgrade;
 use std::task::{Context, Poll};
 use void::Void;
 
@@ -44,8 +40,8 @@ impl PendingConnectionHandler {
 }
 
 impl ConnectionHandler for PendingConnectionHandler {
-    type InEvent = Void;
-    type OutEvent = Void;
+    type FromBehaviour = Void;
+    type ToBehaviour = Void;
     type Error = Void;
     type InboundProtocol = PendingUpgrade<String>;
     type OutboundProtocol = PendingUpgrade<String>;
@@ -56,48 +52,8 @@ impl ConnectionHandler for PendingConnectionHandler {
         SubstreamProtocol::new(PendingUpgrade::new(self.protocol_name.clone()), ())
     }
 
-    fn inject_fully_negotiated_inbound(
-        &mut self,
-        protocol: <Self::InboundProtocol as InboundUpgrade<NegotiatedSubstream>>::Output,
-        _: Self::InboundOpenInfo,
-    ) {
-        void::unreachable(protocol)
-    }
-
-    fn inject_fully_negotiated_outbound(
-        &mut self,
-        protocol: <Self::OutboundProtocol as OutboundUpgrade<NegotiatedSubstream>>::Output,
-        _info: Self::OutboundOpenInfo,
-    ) {
-        void::unreachable(protocol);
-        #[allow(unreachable_code)]
-        {
-            void::unreachable(_info);
-        }
-    }
-
-    fn inject_event(&mut self, v: Self::InEvent) {
+    fn on_behaviour_event(&mut self, v: Self::FromBehaviour) {
         void::unreachable(v)
-    }
-
-    fn inject_address_change(&mut self, _: &Multiaddr) {}
-
-    fn inject_dial_upgrade_error(
-        &mut self,
-        _: Self::OutboundOpenInfo,
-        _: ConnectionHandlerUpgrErr<
-            <Self::OutboundProtocol as OutboundUpgrade<NegotiatedSubstream>>::Error,
-        >,
-    ) {
-    }
-
-    fn inject_listen_upgrade_error(
-        &mut self,
-        _: Self::InboundOpenInfo,
-        _: ConnectionHandlerUpgrErr<
-            <Self::InboundProtocol as InboundUpgrade<NegotiatedSubstream>>::Error,
-        >,
-    ) {
     }
 
     fn connection_keep_alive(&self) -> KeepAlive {
@@ -111,10 +67,41 @@ impl ConnectionHandler for PendingConnectionHandler {
         ConnectionHandlerEvent<
             Self::OutboundProtocol,
             Self::OutboundOpenInfo,
-            Self::OutEvent,
+            Self::ToBehaviour,
             Self::Error,
         >,
     > {
         Poll::Pending
+    }
+
+    fn on_connection_event(
+        &mut self,
+        event: ConnectionEvent<
+            Self::InboundProtocol,
+            Self::OutboundProtocol,
+            Self::InboundOpenInfo,
+            Self::OutboundOpenInfo,
+        >,
+    ) {
+        match event {
+            ConnectionEvent::FullyNegotiatedInbound(FullyNegotiatedInbound {
+                protocol, ..
+            }) => void::unreachable(protocol),
+            ConnectionEvent::FullyNegotiatedOutbound(FullyNegotiatedOutbound {
+                protocol,
+                info: _info,
+            }) => {
+                void::unreachable(protocol);
+                #[allow(unreachable_code, clippy::used_underscore_binding)]
+                {
+                    void::unreachable(_info);
+                }
+            }
+            ConnectionEvent::AddressChange(_)
+            | ConnectionEvent::DialUpgradeError(_)
+            | ConnectionEvent::ListenUpgradeError(_)
+            | ConnectionEvent::LocalProtocolsChange(_)
+            | ConnectionEvent::RemoteProtocolsChange(_) => {}
+        }
     }
 }

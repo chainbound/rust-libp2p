@@ -1,7 +1,7 @@
-use crate::identity::error::SigningError;
-use crate::identity::Keypair;
-use crate::{identity, PublicKey};
-use std::convert::TryInto;
+use crate::{proto, DecodeError};
+use libp2p_identity::SigningError;
+use libp2p_identity::{Keypair, PublicKey};
+use quick_protobuf::{BytesReader, Writer};
 use std::fmt;
 use unsigned_varint::encode::usize_buffer;
 
@@ -73,37 +73,37 @@ impl SignedEnvelope {
 
     /// Encode this [`SignedEnvelope`] using the protobuf encoding specified in the RFC.
     pub fn into_protobuf_encoding(self) -> Vec<u8> {
-        use prost::Message;
+        use quick_protobuf::MessageWrite;
 
-        let envelope = crate::envelope_proto::Envelope {
-            public_key: Some((&self.key).into()),
+        let envelope = proto::Envelope {
+            public_key: self.key.encode_protobuf(),
             payload_type: self.payload_type,
             payload: self.payload,
             signature: self.signature,
         };
 
-        let mut buf = Vec::with_capacity(envelope.encoded_len());
+        let mut buf = Vec::with_capacity(envelope.get_size());
+        let mut writer = Writer::new(&mut buf);
+
         envelope
-            .encode(&mut buf)
-            .expect("Vec<u8> provides capacity as needed");
+            .write_message(&mut writer)
+            .expect("Encoding to succeed");
 
         buf
     }
 
     /// Decode a [`SignedEnvelope`] using the protobuf encoding specified in the RFC.
     pub fn from_protobuf_encoding(bytes: &[u8]) -> Result<Self, DecodingError> {
-        use prost::Message;
+        use quick_protobuf::MessageRead;
 
-        let envelope = crate::envelope_proto::Envelope::decode(bytes)?;
+        let mut reader = BytesReader::from_bytes(bytes);
+        let envelope = proto::Envelope::from_reader(&mut reader, bytes).map_err(DecodeError)?;
 
         Ok(Self {
-            key: envelope
-                .public_key
-                .ok_or(DecodingError::MissingPublicKey)?
-                .try_into()?,
-            payload_type: envelope.payload_type,
-            payload: envelope.payload,
-            signature: envelope.signature,
+            key: PublicKey::try_decode_protobuf(&envelope.public_key)?,
+            payload_type: envelope.payload_type.to_vec(),
+            payload: envelope.payload.to_vec(),
+            signature: envelope.signature.to_vec(),
         })
     }
 }
@@ -140,46 +140,17 @@ fn signature_payload(domain_separation: String, payload_type: &[u8], payload: &[
 }
 
 /// Errors that occur whilst decoding a [`SignedEnvelope`] from its byte representation.
-#[derive(Debug)]
+#[derive(thiserror::Error, Debug)]
 pub enum DecodingError {
     /// Decoding the provided bytes as a signed envelope failed.
-    InvalidEnvelope(prost::DecodeError),
+    #[error("Failed to decode envelope")]
+    InvalidEnvelope(#[from] DecodeError),
     /// The public key in the envelope could not be converted to our internal public key type.
-    InvalidPublicKey(identity::error::DecodingError),
+    #[error("Failed to convert public key")]
+    InvalidPublicKey(#[from] libp2p_identity::DecodingError),
     /// The public key in the envelope could not be converted to our internal public key type.
+    #[error("Public key is missing from protobuf struct")]
     MissingPublicKey,
-}
-
-impl From<prost::DecodeError> for DecodingError {
-    fn from(e: prost::DecodeError) -> Self {
-        Self::InvalidEnvelope(e)
-    }
-}
-
-impl From<identity::error::DecodingError> for DecodingError {
-    fn from(e: identity::error::DecodingError) -> Self {
-        Self::InvalidPublicKey(e)
-    }
-}
-
-impl fmt::Display for DecodingError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InvalidEnvelope(_) => write!(f, "Failed to decode envelope"),
-            Self::InvalidPublicKey(_) => write!(f, "Failed to convert public key"),
-            Self::MissingPublicKey => write!(f, "Public key is missing from protobuf struct"),
-        }
-    }
-}
-
-impl std::error::Error for DecodingError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::InvalidEnvelope(inner) => Some(inner),
-            Self::InvalidPublicKey(inner) => Some(inner),
-            Self::MissingPublicKey => None,
-        }
-    }
 }
 
 /// Errors that occur whilst extracting the payload of a [`SignedEnvelope`].
@@ -197,8 +168,7 @@ impl fmt::Display for ReadPayloadError {
             Self::InvalidSignature => write!(f, "Invalid signature"),
             Self::UnexpectedPayloadType { expected, got } => write!(
                 f,
-                "Unexpected payload type, expected {:?} but got {:?}",
-                expected, got
+                "Unexpected payload type, expected {expected:?} but got {got:?}"
             ),
         }
     }
@@ -211,7 +181,7 @@ mod tests {
     use super::*;
 
     #[test]
-    pub fn test_roundtrip() {
+    fn test_roundtrip() {
         let kp = Keypair::generate_ed25519();
         let payload = "some payload".as_bytes();
         let domain_separation = "domain separation".to_string();

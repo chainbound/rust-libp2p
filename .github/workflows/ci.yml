@@ -6,218 +6,278 @@ on:
     branches:
       - master
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SEGMENT_DOWNLOAD_TIMEOUT_MINS: 2 # Fail cache download after 2 minutes.
+
 jobs:
-  test-desktop:
-    name: Build and test
-    runs-on: ubuntu-latest
+  test:
+    name: Test ${{ matrix.crate }}
+    runs-on: ${{ fromJSON(
+      github.repository == 'libp2p/rust-libp2p' && (
+        (contains(fromJSON('["libp2p-webrtc", "libp2p"]'), matrix.crate) && '["self-hosted", "linux", "x64", "2xlarge"]') ||
+        (contains(fromJSON('["libp2p-quic", "libp2p-perf"]'), matrix.crate) && '["self-hosted", "linux", "x64", "xlarge"]') ||
+        '["self-hosted", "linux", "x64", "large"]'
+      ) || '"ubuntu-latest"') }}
+    timeout-minutes: 10
+    needs: gather_published_crates
     strategy:
+      fail-fast: false
       matrix:
-        args: [
-          "--no-default-features",
-          "--all-features",
-          "--benches --all-features",
-        ]
-    steps:
-
-    - name: Cancel Previous Runs
-      uses: styfle/cancel-workflow-action@bb6001c4ea612bf59c3abfc4756fbceee4f870c7 # 0.10.0
-      with:
-        access_token: ${{ github.token }}
-
-    - name: Install Protoc
-      uses: arduino/setup-protoc@v1
-
-    - uses: actions/checkout@v3
-
-    - uses: Swatinem/rust-cache@6720f05bc48b77f96918929a9019fb2203ff71f8 # v2.0.0
-      with:
-        key: ${{ matrix.args }}
-
-    - run: cargo test --workspace ${{ matrix.args }}
-
-  test-wasm:
-    name: Build on WASM
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        toolchain: [
-          wasm32-unknown-emscripten,
-          wasm32-wasi
-        ]
-        include:
-          - toolchain: wasm32-unknown-unknown
-            args: "--features wasm-bindgen"
+        crate: ${{ fromJSON(needs.gather_published_crates.outputs.members) }}
     env:
-      CC: clang-11
-    defaults:
-      run:
-        shell: bash
+      CRATE: ${{ matrix.crate }}
     steps:
+      - uses: actions/checkout@v3
 
-    - name: Cancel Previous Runs
-      uses: styfle/cancel-workflow-action@bb6001c4ea612bf59c3abfc4756fbceee4f870c7 # 0.10.0
-      with:
-        access_token: ${{ github.token }}
+      - uses: r7kamura/rust-problem-matchers@d58b70c4a13c4866d96436315da451d8106f8f08 #v1.3.0
 
-    - name: Install Protoc
-      uses: arduino/setup-protoc@v1
+      - uses: dtolnay/rust-toolchain@stable
 
-    - uses: actions/checkout@v3
+      - uses: Swatinem/rust-cache@988c164c3d0e93c4dbab36aaf5bbeb77425b2894 # v2.4.0
+        with:
+          shared-key: stable-cache
+          save-if: false
 
-    - name: Install Rust ${{ matrix.toolchain }}
-      uses: actions-rs/toolchain@16499b5e05bf2e26879000db0c1d13f7e13fa3af # v1.0.7
-      with:
-        toolchain: stable
-        target: ${{ matrix.toolchain }}
-        override: true
+      - name: Run all tests
+        run: cargo test --package "$CRATE" --all-features
 
-    - name: Install a recent version of clang
-      run: |
-        sudo bash -c "$(wget -O - https://apt.llvm.org/llvm.sh)"
+      - name: Check if we compile without any features activated
+        run: cargo build --package "$CRATE" --no-default-features
 
-    - name: Install CMake
-      run: sudo apt-get install -y cmake
+      - run: cargo clean
 
-    - uses: Swatinem/rust-cache@6720f05bc48b77f96918929a9019fb2203ff71f8 # v2.0.0
-      with:
-        key: ${{ matrix.toolchain }}
+      - name: Check if crate has been released
+        id: check-released
+        run: |
+          RESPONSE_CODE=$(curl https://crates.io/api/v1/crates/"$CRATE" --silent --write-out "%{http_code}" --output /dev/null)
+          echo "code=${RESPONSE_CODE}"
+          echo "code=${RESPONSE_CODE}" >> $GITHUB_OUTPUT
 
-    - name: Build on ${{ matrix.toolchain }}
-      # TODO: also run `cargo test`
-      # TODO: ideally we would build `--workspace`, but not all crates compile for WASM
-      run: cargo build --target=${{ matrix.toolchain }} ${{ matrix.args }}
+      - uses: ./.github/actions/cargo-semver-checks
+        if: steps.check-released.outputs.code == 200 # Workaround until https://github.com/obi1kenobi/cargo-semver-check/issues/146 is shipped.
+        with:
+          crate: env.CRATE
+
+      - name: Enforce no dependency on meta crate
+        run: |
+          cargo metadata --format-version=1 --no-deps | \
+          jq -e -r '.packages[] | select(.name == "'"$CRATE"'") | .dependencies | all(.name != "libp2p")'
+
+      - uses: taiki-e/cache-cargo-install-action@924d49e0af41f449f0ad549559bc608ee4653562 # v1
+        with:
+          tool: tomlq
+
+      - name: Enforce version in `workspace.dependencies` matches latest version
+        if: env.CRATE != 'libp2p'
+        run: |
+          PACKAGE_VERSION=$(cargo metadata --format-version=1 --no-deps | jq -e -r '.packages[] | select(.name == "'"$CRATE"'") | .version')
+          SPECIFIED_VERSION=$(tomlq "workspace.dependencies.$CRATE.version" --file ./Cargo.toml)
+          
+          echo "Package version: $PACKAGE_VERSION";
+          echo "Specified version: $SPECIFIED_VERSION";
+
+          test "$PACKAGE_VERSION" = "$SPECIFIED_VERSION"
+
+  cross:
+    name: Compile on ${{ matrix.target }}
+    strategy:
+      matrix:
+        include:
+          - target: "wasm32-unknown-unknown"
+            os: ubuntu-latest
+          - target: "wasm32-unknown-emscripten"
+            os: ubuntu-latest
+          - target: "wasm32-wasi"
+            os: ubuntu-latest
+          - target: "x86_64-apple-darwin"
+            os: macos-latest
+          - target: "x86_64-pc-windows-msvc"
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v3
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          target: ${{ matrix.target }}
+
+      - uses: r7kamura/rust-problem-matchers@d58b70c4a13c4866d96436315da451d8106f8f08 #v1.3.0
+
+      - uses: Swatinem/rust-cache@988c164c3d0e93c4dbab36aaf5bbeb77425b2894 # v2.4.0
+        with:
+          key: ${{ matrix.target }}
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+
+      - run: cargo check --package libp2p --all-features --target=${{ matrix.target }}
+
+  msrv:
+    name: Compile with MSRV
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Extract MSRV from workspace manifest
+        shell: bash
+        run: |
+          MSRV=$(grep -oP 'rust-version\s*=\s*"\K[^"]+' Cargo.toml)
+          echo "MSRV=$MSRV" >> $GITHUB_ENV
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.MSRV }}
+
+      - uses: r7kamura/rust-problem-matchers@d58b70c4a13c4866d96436315da451d8106f8f08 #v1.3.0
+
+      - uses: Swatinem/rust-cache@988c164c3d0e93c4dbab36aaf5bbeb77425b2894 # v2.4.0
+        with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+
+      - run: cargo +$MSRV check --workspace --all-features
+
+  feature_matrix: # Test various feature combinations work correctly
+    name: Compile with select features (${{ matrix.features }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - features: "mdns tcp dns tokio"
+          - features: "mdns tcp dns async-std"
+    steps:
+      - uses: actions/checkout@v3
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: r7kamura/rust-problem-matchers@d58b70c4a13c4866d96436315da451d8106f8f08 #v1.3.0
+
+      - uses: Swatinem/rust-cache@988c164c3d0e93c4dbab36aaf5bbeb77425b2894 # v2.4.0
+        with:
+          key: ${{ matrix.features }}
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+
+      - run: cargo check --package libp2p --features="${{ matrix.features }}"
 
   check-rustdoc-links:
     name: Check rustdoc intra-doc links
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v3
 
-    - name: Cancel Previous Runs
-      uses: styfle/cancel-workflow-action@bb6001c4ea612bf59c3abfc4756fbceee4f870c7 # 0.10.0
-      with:
-        access_token: ${{ github.token }}
+      - uses: dtolnay/rust-toolchain@stable
 
-    - name: Install Protoc
-      uses: arduino/setup-protoc@v1
+      - uses: r7kamura/rust-problem-matchers@d58b70c4a13c4866d96436315da451d8106f8f08 #v1.3.0
 
-    - uses: actions/checkout@v3
+      - uses: Swatinem/rust-cache@988c164c3d0e93c4dbab36aaf5bbeb77425b2894 # v2.4.0
+        with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
 
-    - uses: actions-rs/toolchain@16499b5e05bf2e26879000db0c1d13f7e13fa3af # v1.0.7
-      with:
-        profile: minimal
-        toolchain: stable
-        override: true
+      - name: Check rustdoc links
+        run: RUSTDOCFLAGS="--deny rustdoc::broken_intra_doc_links --deny warnings" cargo doc --verbose --workspace --no-deps --all-features --document-private-items
 
-    - uses: Swatinem/rust-cache@6720f05bc48b77f96918929a9019fb2203ff71f8 # v2.0.0
+  clippy:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        rust-version: [
+          1.70.0, # current stable
+          beta
+        ]
+    steps:
+      - uses: actions/checkout@v3
 
-    - name: Check rustdoc links
-      run: RUSTDOCFLAGS="--deny rustdoc::broken_intra_doc_links --deny warnings" cargo doc --verbose --workspace --no-deps --all-features --document-private-items
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust-version }}
+          components: clippy
 
-  check-clippy:
+      - uses: r7kamura/rust-problem-matchers@d58b70c4a13c4866d96436315da451d8106f8f08 #v1.3.0
+
+      - uses: Swatinem/rust-cache@988c164c3d0e93c4dbab36aaf5bbeb77425b2894 # v2.4.0
+        with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+
+      - name: Run cargo clippy
+        run: cargo custom-clippy # cargo alias to allow reuse of config locally
+
+  ipfs-integration-test:
+    name: IPFS Integration tests
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v3
 
-    - name: Cancel Previous Runs
-      uses: styfle/cancel-workflow-action@bb6001c4ea612bf59c3abfc4756fbceee4f870c7 # 0.10.0
-      with:
-        access_token: ${{ github.token }}
+      - uses: dtolnay/rust-toolchain@stable
 
-    - name: Install Protoc
-      uses: arduino/setup-protoc@v1
+      - uses: r7kamura/rust-problem-matchers@d58b70c4a13c4866d96436315da451d8106f8f08 #v1.3.0
 
-    - uses: actions/checkout@v3
+      - uses: Swatinem/rust-cache@988c164c3d0e93c4dbab36aaf5bbeb77425b2894 # v2.4.0
+        with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
 
-    - uses: actions-rs/toolchain@16499b5e05bf2e26879000db0c1d13f7e13fa3af # v1.0.7
-      with:
-        profile: minimal
-        toolchain: stable
-        override: true
-        components: clippy
+      - name: Run ipfs-kad example
+        run: cd ./examples/ipfs-kad/ && RUST_LOG=libp2p_swarm=debug,libp2p_kad=trace,libp2p_tcp=debug cargo run
 
-    - uses: Swatinem/rust-cache@6720f05bc48b77f96918929a9019fb2203ff71f8 # v2.0.0
-
-    - name: Run cargo clippy
-      uses: actions-rs/cargo@844f36862e911db73fe0815f00a4a2602c279505 # v1.0.3
-      with:
-        command: custom-clippy # cargo alias to allow reuse of config locally
-
-  integration-test:
-    name: Integration tests
+  examples:
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v3
 
-    - name: Cancel Previous Runs
-      uses: styfle/cancel-workflow-action@bb6001c4ea612bf59c3abfc4756fbceee4f870c7 # 0.10.0
-      with:
-        access_token: ${{ github.token }}
+      - uses: dtolnay/rust-toolchain@stable
 
-    - name: Install Protoc
-      uses: arduino/setup-protoc@v1
+      - uses: r7kamura/rust-problem-matchers@d58b70c4a13c4866d96436315da451d8106f8f08 #v1.3.0
 
-    - uses: actions/checkout@v3
+      - uses: Swatinem/rust-cache@988c164c3d0e93c4dbab36aaf5bbeb77425b2894 # v2.4.0
+        with:
+          shared-key: stable-cache
+          save-if: false
 
-    - uses: actions-rs/toolchain@16499b5e05bf2e26879000db0c1d13f7e13fa3af # v1.0.7
-      with:
-        profile: minimal
-        toolchain: stable
-        override: true
+      - name: Compile all examples
+        run: |
+          set -e;
 
-    - uses: Swatinem/rust-cache@6720f05bc48b77f96918929a9019fb2203ff71f8 # v2.0.0
-
-    - name: Run ipfs-kad example
-      run: RUST_LOG=libp2p_swarm=debug,libp2p_kad=trace,libp2p_tcp=debug cargo run --example ipfs-kad --features full
+          for toml in examples/**/Cargo.toml; do
+            cargo check --manifest-path "$toml";
+          done
 
   rustfmt:
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v3
 
-    - name: Cancel Previous Runs
-      uses: styfle/cancel-workflow-action@bb6001c4ea612bf59c3abfc4756fbceee4f870c7 # 0.10.0
-      with:
-        access_token: ${{ github.token }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
 
-    - uses: actions/checkout@v3
+      - uses: r7kamura/rust-problem-matchers@d58b70c4a13c4866d96436315da451d8106f8f08 #v1.3.0
 
-    - uses: actions-rs/toolchain@16499b5e05bf2e26879000db0c1d13f7e13fa3af # v1.0.7
-      with:
-        profile: minimal
-        toolchain: stable
-        override: true
-        components: rustfmt
-
-    - name: Check formatting
-      run: cargo fmt -- --check
+      - name: Check formatting
+        run: cargo fmt -- --check
 
   manifest_lint:
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v3
 
-    - name: Cancel Previous Runs
-      uses: styfle/cancel-workflow-action@bb6001c4ea612bf59c3abfc4756fbceee4f870c7 # 0.10.0
-      with:
-        access_token: ${{ github.token }}
+      - uses: dtolnay/rust-toolchain@stable
 
-    - uses: actions/checkout@v3
+      - uses: r7kamura/rust-problem-matchers@d58b70c4a13c4866d96436315da451d8106f8f08 #v1.3.0
 
-    - uses: actions-rs/toolchain@16499b5e05bf2e26879000db0c1d13f7e13fa3af # v1.0.7
-      with:
-        profile: minimal
-        toolchain: stable
-        override: true
+      - name: Ensure `full` feature contains all features
+        run: |
+          ALL_FEATURES=$(cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | select(.name == "libp2p") | .features | keys | map(select(. != "full")) | sort | join(" ")')
+          FULL_FEATURE=$(cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | select(.name == "libp2p") | .features["full"] | sort | join(" ")')
 
-    - name: Ensure `full` feature contains all features
-      run: |
-        ALL_FEATURES=$(cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | select(.name == "libp2p") | .features | keys | map(select(. != "full")) | sort | join(" ")')
-        FULL_FEATURE=$(cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | select(.name == "libp2p") | .features["full"] | sort | join(" ")')
-        
-        test "$ALL_FEATURES = $FULL_FEATURE"
+          test "$ALL_FEATURES = $FULL_FEATURE"
 
-        echo "$ALL_FEATURES";
-        echo "$FULL_FEATURE";
-        
-        test "$ALL_FEATURES" = "$FULL_FEATURE"
+          echo "$ALL_FEATURES";
+          echo "$FULL_FEATURE";
 
-  gather_crates_for_semver_checks:
+          test "$ALL_FEATURES" = "$FULL_FEATURE"
+
+  gather_published_crates:
     runs-on: ubuntu-latest
     outputs:
       members: ${{ steps.cargo-metadata.outputs.members }}
@@ -226,36 +286,40 @@ jobs:
 
       - id: cargo-metadata
         run: |
-          WORKSPACE_MEMBERS=$(cargo metadata --format-version=1 --no-deps | jq -c '.packages | .[] | select(.publish == null) | .name' | jq -s '.' | jq -c '.')
-          echo "::set-output name=members::${WORKSPACE_MEMBERS}"
+          WORKSPACE_MEMBERS=$(cargo metadata --format-version=1 --no-deps | jq -c '.packages | map(select(.publish == null) | .name)')
+          echo "members=${WORKSPACE_MEMBERS}" >> $GITHUB_OUTPUT
 
-  semver-check:
+  check-proto-files:
+    name: Check for changes in proto files
     runs-on: ubuntu-latest
-    needs: gather_crates_for_semver_checks
-    strategy:
-      fail-fast: false
-      matrix:
-        crate: ${{ fromJSON(needs.gather_crates_for_semver_checks.outputs.members) }}
     steps:
-    - name: Cancel Previous Runs
-      uses: styfle/cancel-workflow-action@bb6001c4ea612bf59c3abfc4756fbceee4f870c7 # 0.10.0
-      with:
-        access_token: ${{ github.token }}
+      - uses: actions/checkout@v3
 
-    - uses: actions/checkout@v3
+      - uses: Swatinem/rust-cache@988c164c3d0e93c4dbab36aaf5bbeb77425b2894 # v2.4.0
 
-    - uses: actions-rs/toolchain@16499b5e05bf2e26879000db0c1d13f7e13fa3af # v1.0.7
-      with:
-        profile: minimal
-        toolchain: stable
-        override: true
+      - run: cargo install --version 0.10.0 pb-rs --locked
 
-    - name: Install Protoc
-      uses: arduino/setup-protoc@v1
+      - name: Glob match
+        uses: tj-actions/glob@v17
+        id: glob
+        with:
+          files: |
+            **/generated/*.proto
 
-    - uses: Swatinem/rust-cache@6720f05bc48b77f96918929a9019fb2203ff71f8 # v2.0.0
+      - name: Generate proto files
+        run: pb-rs --dont_use_cow ${{ steps.glob.outputs.paths }}
 
-    - run: cargo install cargo-semver-checks
-    
-    - name: Semver Check
-      run: cargo semver-checks check-release -p ${{ matrix.crate }}
+      - name: Ensure generated files are unmodified # https://stackoverflow.com/a/5737794
+        run: |
+            git_status=$(git status --porcelain)
+
+            echo $git_status
+            test -z "$git_status"
+
+  ensure-lockfile-uptodate:
+    name: Ensure that `Cargo.lock` is up-to-date
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: Swatinem/rust-cache@988c164c3d0e93c4dbab36aaf5bbeb77425b2894 # v2.4.0
+      - run: cargo metadata --locked --format-version=1 > /dev/null

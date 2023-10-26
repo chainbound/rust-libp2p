@@ -19,19 +19,22 @@
 // DEALINGS IN THE SOFTWARE.
 
 use super::dns;
-use crate::{META_QUERY_SERVICE, SERVICE_NAME};
-use dns_parser::{Packet, RData};
+use crate::{META_QUERY_SERVICE_FQDN, SERVICE_NAME_FQDN};
 use libp2p_core::{
     address_translation,
     multiaddr::{Multiaddr, Protocol},
-    PeerId,
 };
+use libp2p_identity::PeerId;
 use std::time::Instant;
-use std::{convert::TryFrom, fmt, net::SocketAddr, str, time::Duration};
+use std::{fmt, net::SocketAddr, str, time::Duration};
+use trust_dns_proto::{
+    op::Message,
+    rr::{Name, RData},
+};
 
 /// A valid mDNS packet received by the service.
 #[derive(Debug)]
-pub enum MdnsPacket {
+pub(crate) enum MdnsPacket {
     /// A query made by a remote.
     Query(MdnsQuery),
     /// A response sent by a remote in response to one of our queries.
@@ -41,36 +44,36 @@ pub enum MdnsPacket {
 }
 
 impl MdnsPacket {
-    pub fn new_from_bytes(
+    pub(crate) fn new_from_bytes(
         buf: &[u8],
         from: SocketAddr,
-    ) -> Result<Option<MdnsPacket>, dns_parser::Error> {
-        let packet = Packet::parse(buf)?;
+    ) -> Result<Option<MdnsPacket>, trust_dns_proto::error::ProtoError> {
+        let packet = Message::from_vec(buf)?;
 
-        if !packet.header.query {
-            return Ok(Some(MdnsPacket::Response(MdnsResponse::new(packet, from))));
+        if packet.query().is_none() {
+            return Ok(Some(MdnsPacket::Response(MdnsResponse::new(&packet, from))));
         }
 
         if packet
-            .questions
+            .queries()
             .iter()
-            .any(|q| q.qname.to_string().as_bytes() == SERVICE_NAME)
+            .any(|q| q.name().to_utf8() == SERVICE_NAME_FQDN)
         {
             return Ok(Some(MdnsPacket::Query(MdnsQuery {
                 from,
-                query_id: packet.header.id,
+                query_id: packet.header().id(),
             })));
         }
 
         if packet
-            .questions
+            .queries()
             .iter()
-            .any(|q| q.qname.to_string().as_bytes() == META_QUERY_SERVICE)
+            .any(|q| q.name().to_utf8() == META_QUERY_SERVICE_FQDN)
         {
             // TODO: what if multiple questions, one with SERVICE_NAME and one with META_QUERY_SERVICE?
             return Ok(Some(MdnsPacket::ServiceDiscovery(MdnsServiceDiscovery {
                 from,
-                query_id: packet.header.id,
+                query_id: packet.header().id(),
             })));
         }
 
@@ -79,7 +82,7 @@ impl MdnsPacket {
 }
 
 /// A received mDNS query.
-pub struct MdnsQuery {
+pub(crate) struct MdnsQuery {
     /// Sender of the address.
     from: SocketAddr,
     /// Id of the received DNS query. We need to pass this ID back in the results.
@@ -88,12 +91,12 @@ pub struct MdnsQuery {
 
 impl MdnsQuery {
     /// Source address of the packet.
-    pub fn remote_addr(&self) -> &SocketAddr {
+    pub(crate) fn remote_addr(&self) -> &SocketAddr {
         &self.from
     }
 
     /// Query id of the packet.
-    pub fn query_id(&self) -> u16 {
+    pub(crate) fn query_id(&self) -> u16 {
         self.query_id
     }
 }
@@ -108,7 +111,7 @@ impl fmt::Debug for MdnsQuery {
 }
 
 /// A received mDNS service discovery query.
-pub struct MdnsServiceDiscovery {
+pub(crate) struct MdnsServiceDiscovery {
     /// Sender of the address.
     from: SocketAddr,
     /// Id of the received DNS query. We need to pass this ID back in the results.
@@ -117,12 +120,12 @@ pub struct MdnsServiceDiscovery {
 
 impl MdnsServiceDiscovery {
     /// Source address of the packet.
-    pub fn remote_addr(&self) -> &SocketAddr {
+    pub(crate) fn remote_addr(&self) -> &SocketAddr {
         &self.from
     }
 
     /// Query id of the packet.
-    pub fn query_id(&self) -> u16 {
+    pub(crate) fn query_id(&self) -> u16 {
         self.query_id
     }
 }
@@ -137,35 +140,35 @@ impl fmt::Debug for MdnsServiceDiscovery {
 }
 
 /// A received mDNS response.
-pub struct MdnsResponse {
+pub(crate) struct MdnsResponse {
     peers: Vec<MdnsPeer>,
     from: SocketAddr,
 }
 
 impl MdnsResponse {
     /// Creates a new `MdnsResponse` based on the provided `Packet`.
-    pub fn new(packet: Packet<'_>, from: SocketAddr) -> MdnsResponse {
+    pub(crate) fn new(packet: &Message, from: SocketAddr) -> MdnsResponse {
         let peers = packet
-            .answers
+            .answers()
             .iter()
             .filter_map(|record| {
-                if record.name.to_string().as_bytes() != SERVICE_NAME {
+                if record.name().to_string() != SERVICE_NAME_FQDN {
                     return None;
                 }
 
-                let record_value = match record.data {
-                    RData::PTR(record) => record.0.to_string(),
+                let record_value = match record.data() {
+                    Some(RData::PTR(record)) => record,
                     _ => return None,
                 };
 
-                MdnsPeer::new(&packet, record_value, record.ttl)
+                MdnsPeer::new(packet, record_value, record.ttl())
             })
             .collect();
 
         MdnsResponse { peers, from }
     }
 
-    pub fn extract_discovered(
+    pub(crate) fn extract_discovered(
         &self,
         now: Instant,
         local_peer_id: PeerId,
@@ -185,7 +188,7 @@ impl MdnsResponse {
     }
 
     /// Source address of the packet.
-    pub fn remote_addr(&self) -> &SocketAddr {
+    pub(crate) fn remote_addr(&self) -> &SocketAddr {
         &self.from
     }
 
@@ -215,7 +218,7 @@ impl fmt::Debug for MdnsResponse {
 }
 
 /// A peer discovered by the service.
-pub struct MdnsPeer {
+pub(crate) struct MdnsPeer {
     addrs: Vec<Multiaddr>,
     /// Id of the peer.
     peer_id: PeerId,
@@ -225,17 +228,17 @@ pub struct MdnsPeer {
 
 impl MdnsPeer {
     /// Creates a new `MdnsPeer` based on the provided `Packet`.
-    pub fn new(packet: &Packet<'_>, record_value: String, ttl: u32) -> Option<MdnsPeer> {
+    pub(crate) fn new(packet: &Message, record_value: &Name, ttl: u32) -> Option<MdnsPeer> {
         let mut my_peer_id: Option<PeerId> = None;
         let addrs = packet
-            .additional
+            .additionals()
             .iter()
             .filter_map(|add_record| {
-                if add_record.name.to_string() != record_value {
+                if add_record.name() != record_value {
                     return None;
                 }
 
-                if let RData::TXT(ref txt) = add_record.data {
+                if let Some(RData::TXT(ref txt)) = add_record.data() {
                     Some(txt)
                 } else {
                     None
@@ -261,16 +264,12 @@ impl MdnsPeer {
                 };
                 match addr.pop() {
                     Some(Protocol::P2p(peer_id)) => {
-                        if let Ok(peer_id) = PeerId::try_from(peer_id) {
-                            if let Some(pid) = &my_peer_id {
-                                if peer_id != *pid {
-                                    return None;
-                                }
-                            } else {
-                                my_peer_id.replace(peer_id);
+                        if let Some(pid) = &my_peer_id {
+                            if peer_id != *pid {
+                                return None;
                             }
                         } else {
-                            return None;
+                            my_peer_id.replace(peer_id);
                         }
                     }
                     _ => return None,
@@ -288,20 +287,20 @@ impl MdnsPeer {
 
     /// Returns the id of the peer.
     #[inline]
-    pub fn id(&self) -> &PeerId {
+    pub(crate) fn id(&self) -> &PeerId {
         &self.peer_id
     }
 
     /// Returns the requested time-to-live for the record.
     #[inline]
-    pub fn ttl(&self) -> Duration {
+    pub(crate) fn ttl(&self) -> Duration {
         Duration::from_secs(u64::from(self.ttl))
     }
 
     /// Returns the list of addresses the peer says it is listening on.
     ///
     /// Filters out invalid addresses.
-    pub fn addresses(&self) -> &Vec<Multiaddr> {
+    pub(crate) fn addresses(&self) -> &Vec<Multiaddr> {
         &self.addrs
     }
 }
@@ -326,27 +325,27 @@ mod tests {
 
         let mut addr1: Multiaddr = "/ip4/1.2.3.4/tcp/5000".parse().expect("bad multiaddress");
         let mut addr2: Multiaddr = "/ip6/::1/udp/10000".parse().expect("bad multiaddress");
-        addr1.push(Protocol::P2p(peer_id.into()));
-        addr2.push(Protocol::P2p(peer_id.into()));
+        addr1.push(Protocol::P2p(peer_id));
+        addr2.push(Protocol::P2p(peer_id));
 
         let packets = build_query_response(
             0xf8f8,
             peer_id,
-            vec![addr1, addr2].into_iter(),
+            vec![&addr1, &addr2].into_iter(),
             Duration::from_secs(60),
         );
 
         for bytes in packets {
-            let packet = Packet::parse(&bytes).expect("unable to parse packet");
+            let packet = Message::from_vec(&bytes).expect("unable to parse packet");
             let record_value = packet
-                .answers
+                .answers()
                 .iter()
                 .filter_map(|record| {
-                    if record.name.to_string().as_bytes() != SERVICE_NAME {
+                    if record.name().to_utf8() != SERVICE_NAME_FQDN {
                         return None;
                     }
-                    let record_value = match record.data {
-                        RData::PTR(record) => record.0.to_string(),
+                    let record_value = match record.data() {
+                        Some(RData::PTR(record)) => record,
                         _ => return None,
                     };
                     Some(record_value)

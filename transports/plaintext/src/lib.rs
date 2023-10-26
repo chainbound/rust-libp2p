@@ -18,84 +18,32 @@
 // FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 // DEALINGS IN THE SOFTWARE.
 
+//! Implementation of the [plaintext](https://github.com/libp2p/specs/blob/master/plaintext/README.md) protocol.
+
+#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
+
 use crate::error::PlainTextError;
 
 use bytes::Bytes;
 use futures::future::BoxFuture;
-use futures::future::{self, Ready};
 use futures::prelude::*;
-use libp2p_core::{identity, InboundUpgrade, OutboundUpgrade, PeerId, PublicKey, UpgradeInfo};
+use libp2p_core::{InboundUpgrade, OutboundUpgrade, UpgradeInfo};
+use libp2p_identity as identity;
+use libp2p_identity::PeerId;
+use libp2p_identity::PublicKey;
 use log::debug;
 use std::{
     io, iter,
     pin::Pin,
     task::{Context, Poll},
 };
-use void::Void;
 
 mod error;
 mod handshake;
-#[allow(clippy::derive_partial_eq_without_eq)]
-mod structs_proto {
-    include!(concat!(env!("OUT_DIR"), "/structs.rs"));
-}
-
-/// `PlainText1Config` is an insecure connection handshake for testing purposes only.
-///
-/// > **Note**: Given that `PlainText1Config` has no notion of exchanging peer identity information it is not compatible
-/// > with the `libp2p_core::transport::upgrade::Builder` pattern. See
-/// > [`PlainText2Config`](struct.PlainText2Config.html) if compatibility is needed. Even though not compatible with the
-/// > Builder pattern one can still do an upgrade *manually*:
-///
-/// ```
-/// # use libp2p_core::transport::{ Transport, memory::MemoryTransport };
-/// # use libp2p_plaintext::PlainText1Config;
-/// #
-/// MemoryTransport::default()
-///   .and_then(move |io, endpoint| {
-///     libp2p_core::upgrade::apply(
-///       io,
-///       PlainText1Config{},
-///       endpoint,
-///       libp2p_core::transport::upgrade::Version::V1,
-///     )
-///   })
-///   .map(|plaintext, _endpoint| {
-///     unimplemented!();
-///     // let peer_id = somehow_derive_peer_id();
-///     // return (peer_id, plaintext);
-///   });
-/// ```
-#[derive(Debug, Copy, Clone)]
-pub struct PlainText1Config;
-
-impl UpgradeInfo for PlainText1Config {
-    type Info = &'static [u8];
-    type InfoIter = iter::Once<Self::Info>;
-
-    fn protocol_info(&self) -> Self::InfoIter {
-        iter::once(b"/plaintext/1.0.0")
-    }
-}
-
-impl<C> InboundUpgrade<C> for PlainText1Config {
-    type Output = C;
-    type Error = Void;
-    type Future = Ready<Result<C, Self::Error>>;
-
-    fn upgrade_inbound(self, i: C, _: Self::Info) -> Self::Future {
-        future::ready(Ok(i))
-    }
-}
-
-impl<C> OutboundUpgrade<C> for PlainText1Config {
-    type Output = C;
-    type Error = Void;
-    type Future = Ready<Result<C, Self::Error>>;
-
-    fn upgrade_outbound(self, i: C, _: Self::Info) -> Self::Future {
-        future::ready(Ok(i))
-    }
+mod proto {
+    #![allow(unreachable_pub)]
+    include!("generated/mod.rs");
+    pub(crate) use self::structs::Exchange;
 }
 
 /// `PlainText2Config` is an insecure connection handshake for testing purposes only, implementing
@@ -106,11 +54,11 @@ pub struct PlainText2Config {
 }
 
 impl UpgradeInfo for PlainText2Config {
-    type Info = &'static [u8];
+    type Info = &'static str;
     type InfoIter = iter::Once<Self::Info>;
 
     fn protocol_info(&self) -> Self::InfoIter {
-        iter::once(b"/plaintext/2.0.0")
+        iter::once("/plaintext/2.0.0")
     }
 }
 

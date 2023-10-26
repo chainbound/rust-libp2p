@@ -27,14 +27,13 @@ use super::{
 use futures::FutureExt;
 use futures_timer::Delay;
 use instant::Instant;
-use libp2p_core::{connection::ConnectionId, Multiaddr, PeerId};
-use libp2p_request_response::{
-    OutboundFailure, RequestId, RequestResponse, RequestResponseEvent, RequestResponseMessage,
-};
-use libp2p_swarm::{AddressScore, NetworkBehaviourAction, PollParameters};
+use libp2p_core::Multiaddr;
+use libp2p_identity::PeerId;
+use libp2p_request_response::{self as request_response, OutboundFailure, RequestId};
+use libp2p_swarm::{ConnectionId, ListenAddresses, PollParameters, ToSwarm};
 use rand::{seq::SliceRandom, thread_rng};
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     task::{Context, Poll},
     time::Duration,
 };
@@ -82,38 +81,34 @@ pub enum OutboundProbeEvent {
 }
 
 /// View over [`super::Behaviour`] in a client role.
-pub struct AsClient<'a> {
-    pub inner: &'a mut RequestResponse<AutoNatCodec>,
-    pub local_peer_id: PeerId,
-    pub config: &'a Config,
-    pub connected: &'a HashMap<PeerId, HashMap<ConnectionId, Option<Multiaddr>>>,
-    pub probe_id: &'a mut ProbeId,
-
-    pub servers: &'a Vec<PeerId>,
-    pub throttled_servers: &'a mut Vec<(PeerId, Instant)>,
-
-    pub nat_status: &'a mut NatStatus,
-    pub confidence: &'a mut usize,
-
-    pub ongoing_outbound: &'a mut HashMap<RequestId, ProbeId>,
-
-    pub last_probe: &'a mut Option<Instant>,
-    pub schedule_probe: &'a mut Delay,
+pub(crate) struct AsClient<'a> {
+    pub(crate) inner: &'a mut request_response::Behaviour<AutoNatCodec>,
+    pub(crate) local_peer_id: PeerId,
+    pub(crate) config: &'a Config,
+    pub(crate) connected: &'a HashMap<PeerId, HashMap<ConnectionId, Option<Multiaddr>>>,
+    pub(crate) probe_id: &'a mut ProbeId,
+    pub(crate) servers: &'a HashSet<PeerId>,
+    pub(crate) throttled_servers: &'a mut Vec<(PeerId, Instant)>,
+    pub(crate) nat_status: &'a mut NatStatus,
+    pub(crate) confidence: &'a mut usize,
+    pub(crate) ongoing_outbound: &'a mut HashMap<RequestId, ProbeId>,
+    pub(crate) last_probe: &'a mut Option<Instant>,
+    pub(crate) schedule_probe: &'a mut Delay,
+    pub(crate) listen_addresses: &'a ListenAddresses,
+    pub(crate) other_candidates: &'a HashSet<Multiaddr>,
 }
 
 impl<'a> HandleInnerEvent for AsClient<'a> {
     fn handle_event(
         &mut self,
-        params: &mut impl PollParameters,
-        event: RequestResponseEvent<DialRequest, DialResponse>,
-    ) -> (VecDeque<Event>, Option<Action>) {
-        let mut events = VecDeque::new();
-        let mut action = None;
+        _: &mut impl PollParameters,
+        event: request_response::Event<DialRequest, DialResponse>,
+    ) -> VecDeque<Action> {
         match event {
-            RequestResponseEvent::Message {
+            request_response::Event::Message {
                 peer,
                 message:
-                    RequestResponseMessage::Response {
+                    request_response::Message::Response {
                         request_id,
                         response,
                     },
@@ -137,30 +132,25 @@ impl<'a> HandleInnerEvent for AsClient<'a> {
                         error: OutboundProbeError::Response(e),
                     },
                 };
-                events.push_back(Event::OutboundProbe(event));
+
+                let mut actions = VecDeque::with_capacity(3);
+
+                actions.push_back(ToSwarm::GenerateEvent(Event::OutboundProbe(event)));
 
                 if let Some(old) = self.handle_reported_status(response.result.clone().into()) {
-                    events.push_back(Event::StatusChanged {
+                    actions.push_back(ToSwarm::GenerateEvent(Event::StatusChanged {
                         old,
                         new: self.nat_status.clone(),
-                    });
+                    }));
                 }
 
                 if let Ok(address) = response.result {
-                    // Update observed address score if it is finite.
-                    let score = params
-                        .external_addresses()
-                        .find_map(|r| (r.addr == address).then(|| r.score))
-                        .unwrap_or(AddressScore::Finite(0));
-                    if let AddressScore::Finite(finite_score) = score {
-                        action = Some(NetworkBehaviourAction::ReportObservedAddr {
-                            address,
-                            score: AddressScore::Finite(finite_score + 1),
-                        });
-                    }
+                    actions.push_back(ToSwarm::ExternalAddrConfirmed(address));
                 }
+
+                actions
             }
-            RequestResponseEvent::OutboundFailure {
+            request_response::Event::OutboundFailure {
                 peer,
                 error,
                 request_id,
@@ -175,32 +165,33 @@ impl<'a> HandleInnerEvent for AsClient<'a> {
                     .remove(&request_id)
                     .unwrap_or_else(|| self.probe_id.next());
 
-                events.push_back(Event::OutboundProbe(OutboundProbeEvent::Error {
-                    probe_id,
-                    peer: Some(peer),
-                    error: OutboundProbeError::OutboundRequest(error),
-                }));
-
                 self.schedule_probe.reset(Duration::ZERO);
+
+                VecDeque::from([ToSwarm::GenerateEvent(Event::OutboundProbe(
+                    OutboundProbeEvent::Error {
+                        probe_id,
+                        peer: Some(peer),
+                        error: OutboundProbeError::OutboundRequest(error),
+                    },
+                ))])
             }
-            _ => {}
+            _ => VecDeque::default(),
         }
-        (events, action)
     }
 }
 
 impl<'a> AsClient<'a> {
-    pub fn poll_auto_probe(
-        &mut self,
-        params: &mut impl PollParameters,
-        cx: &mut Context<'_>,
-    ) -> Poll<OutboundProbeEvent> {
+    pub(crate) fn poll_auto_probe(&mut self, cx: &mut Context<'_>) -> Poll<OutboundProbeEvent> {
         match self.schedule_probe.poll_unpin(cx) {
             Poll::Ready(()) => {
                 self.schedule_probe.reset(self.config.retry_interval);
 
-                let mut addresses: Vec<_> = params.external_addresses().map(|r| r.addr).collect();
-                addresses.extend(params.listened_addresses());
+                let addresses = self
+                    .other_candidates
+                    .iter()
+                    .chain(self.listen_addresses.iter())
+                    .cloned()
+                    .collect();
 
                 let probe_id = self.probe_id.next();
                 let event = match self.do_probe(probe_id, addresses) {
@@ -221,7 +212,7 @@ impl<'a> AsClient<'a> {
     }
 
     // An inbound connection can indicate that we are public; adjust the delay to the next probe.
-    pub fn on_inbound_connection(&mut self) {
+    pub(crate) fn on_inbound_connection(&mut self) {
         if *self.confidence == self.config.confidence_max {
             if self.nat_status.is_public() {
                 self.schedule_next_probe(self.config.refresh_interval * 2);
@@ -231,7 +222,7 @@ impl<'a> AsClient<'a> {
         }
     }
 
-    pub fn on_new_address(&mut self) {
+    pub(crate) fn on_new_address(&mut self) {
         if !self.nat_status.is_public() {
             // New address could be publicly reachable, trigger retry.
             if *self.confidence > 0 {
@@ -241,7 +232,7 @@ impl<'a> AsClient<'a> {
         }
     }
 
-    pub fn on_expired_address(&mut self, addr: &Multiaddr) {
+    pub(crate) fn on_expired_address(&mut self, addr: &Multiaddr) {
         if let NatStatus::Public(public_address) = self.nat_status {
             if public_address == addr {
                 *self.confidence = 0;
@@ -266,7 +257,7 @@ impl<'a> AsClient<'a> {
                 // Filter servers for which no qualified address is known.
                 // This is the case if the connection is relayed or the address is
                 // not global (in case of Config::only_global_ips).
-                addrs.values().any(|a| a.is_some()).then(|| id)
+                addrs.values().any(|a| a.is_some()).then_some(id)
             }));
         }
 

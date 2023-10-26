@@ -18,8 +18,9 @@
 // FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 // DEALINGS IN THE SOFTWARE.
 
-use crate::record;
-use libp2p_core::{multihash::Multihash, PeerId};
+use crate::record_priv;
+use libp2p_core::multihash::Multihash;
+use libp2p_identity::PeerId;
 use sha2::digest::generic_array::{typenum::U32, GenericArray};
 use sha2::{Digest, Sha256};
 use std::borrow::Borrow;
@@ -92,16 +93,16 @@ impl<T> From<Key<T>> for KeyBytes {
     }
 }
 
-impl From<Multihash> for Key<Multihash> {
-    fn from(m: Multihash) -> Self {
-        let bytes = KeyBytes(Sha256::digest(&m.to_bytes()));
+impl<const S: usize> From<Multihash<S>> for Key<Multihash<S>> {
+    fn from(m: Multihash<S>) -> Self {
+        let bytes = KeyBytes(Sha256::digest(m.to_bytes()));
         Key { preimage: m, bytes }
     }
 }
 
 impl From<PeerId> for Key<PeerId> {
     fn from(p: PeerId) -> Self {
-        let bytes = KeyBytes(Sha256::digest(&p.to_bytes()));
+        let bytes = KeyBytes(Sha256::digest(p.to_bytes()));
         Key { preimage: p, bytes }
     }
 }
@@ -112,8 +113,8 @@ impl From<Vec<u8>> for Key<Vec<u8>> {
     }
 }
 
-impl From<record::Key> for Key<record::Key> {
-    fn from(k: record::Key) -> Self {
+impl From<record_priv::Key> for Key<record_priv::Key> {
+    fn from(k: record_priv::Key) -> Self {
         Key::new(k)
     }
 }
@@ -195,7 +196,7 @@ impl Distance {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use libp2p_core::multihash::Code;
+    use crate::SHA_256_MH;
     use quickcheck::*;
 
     impl Arbitrary for Key<PeerId> {
@@ -204,10 +205,10 @@ mod tests {
         }
     }
 
-    impl Arbitrary for Key<Multihash> {
-        fn arbitrary(g: &mut Gen) -> Key<Multihash> {
+    impl Arbitrary for Key<Multihash<64>> {
+        fn arbitrary(g: &mut Gen) -> Key<Multihash<64>> {
             let hash: [u8; 32] = core::array::from_fn(|_| u8::arbitrary(g));
-            Key::from(Multihash::wrap(Code::Sha2_256.into(), &hash).unwrap())
+            Key::from(Multihash::wrap(SHA_256_MH, &hash).unwrap())
         }
     }
 

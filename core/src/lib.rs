@@ -22,10 +22,6 @@
 //!
 //! The main concepts of libp2p-core are:
 //!
-//! - A [`PeerId`] is a unique global identifier for a node on the network.
-//!   Each node must have a different [`PeerId`]. Normally, a [`PeerId`] is the
-//!   hash of the public key used to negotiate encryption on the
-//!   communication channel, thereby guaranteeing that they cannot be spoofed.
 //! - The [`Transport`] trait defines how to reach a remote node or listen for
 //!   incoming remote connections. See the [`transport`] module.
 //! - The [`StreamMuxer`] trait is implemented on structs that hold a connection
@@ -35,30 +31,24 @@
 //!   define how to upgrade each individual substream to use a protocol.
 //!   See the `upgrade` module.
 
-#[allow(clippy::derive_partial_eq_without_eq)]
-mod keys_proto {
-    include!(concat!(env!("OUT_DIR"), "/keys_proto.rs"));
-}
+#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
 
-mod envelope_proto {
-    include!(concat!(env!("OUT_DIR"), "/envelope_proto.rs"));
-}
-
-#[allow(clippy::derive_partial_eq_without_eq)]
-mod peer_record_proto {
-    include!(concat!(env!("OUT_DIR"), "/peer_record_proto.rs"));
+mod proto {
+    #![allow(unreachable_pub)]
+    include!("generated/mod.rs");
+    pub use self::{
+        envelope_proto::*, peer_record_proto::mod_PeerRecord::*, peer_record_proto::PeerRecord,
+    };
 }
 
 /// Multi-address re-export.
 pub use multiaddr;
 pub type Negotiated<T> = multistream_select::Negotiated<T>;
 
-mod peer_id;
 mod translation;
 
 pub mod connection;
 pub mod either;
-pub mod identity;
 pub mod muxing;
 pub mod peer_record;
 pub mod signed_envelope;
@@ -66,33 +56,15 @@ pub mod transport;
 pub mod upgrade;
 
 pub use connection::{ConnectedPoint, Endpoint};
-pub use identity::PublicKey;
 pub use multiaddr::Multiaddr;
 pub use multihash;
 pub use muxing::StreamMuxer;
-pub use peer_id::PeerId;
 pub use peer_record::PeerRecord;
 pub use signed_envelope::SignedEnvelope;
 pub use translation::address_translation;
 pub use transport::Transport;
-pub use upgrade::{InboundUpgrade, OutboundUpgrade, ProtocolName, UpgradeError, UpgradeInfo};
+pub use upgrade::{InboundUpgrade, OutboundUpgrade, UpgradeInfo};
 
-use std::{future::Future, pin::Pin};
-
-/// Implemented on objects that can run a `Future` in the background.
-///
-/// > **Note**: While it may be tempting to implement this trait on types such as
-/// >           [`futures::stream::FuturesUnordered`], please note that passing an `Executor` is
-/// >           optional, and that `FuturesUnordered` (or a similar struct) will automatically
-/// >           be used as fallback by libp2p. The `Executor` trait should therefore only be
-/// >           about running `Future`s in the background.
-pub trait Executor {
-    /// Run the given future in the background until it ends.
-    fn exec(&self, future: Pin<Box<dyn Future<Output = ()> + Send>>);
-}
-
-impl<F: Fn(Pin<Box<dyn Future<Output = ()> + Send>>)> Executor for F {
-    fn exec(&self, f: Pin<Box<dyn Future<Output = ()> + Send>>) {
-        self(f)
-    }
-}
+#[derive(Debug, thiserror::Error)]
+#[error(transparent)]
+pub struct DecodeError(quick_protobuf::Error);

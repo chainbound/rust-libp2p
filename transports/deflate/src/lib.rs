@@ -18,6 +18,8 @@
 // FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 // DEALINGS IN THE SOFTWARE.
 
+#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
+
 use futures::{prelude::*, ready};
 use libp2p_core::{InboundUpgrade, OutboundUpgrade, UpgradeInfo};
 use std::{io, iter, pin::Pin, task::Context, task::Poll};
@@ -36,11 +38,11 @@ impl Default for DeflateConfig {
 }
 
 impl UpgradeInfo for DeflateConfig {
-    type Info = &'static [u8];
+    type Info = &'static str;
     type InfoIter = iter::Once<Self::Info>;
 
     fn protocol_info(&self) -> Self::InfoIter {
-        iter::once(b"/deflate/1.0.0")
+        iter::once("/deflate/1.0.0")
     }
 }
 

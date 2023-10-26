@@ -18,16 +18,16 @@
 // FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 // DEALINGS IN THE SOFTWARE.
 
-use crate::error::PlainTextError;
-use crate::structs_proto::Exchange;
+use crate::error::{DecodeError, PlainTextError};
+use crate::proto::Exchange;
 use crate::PlainText2Config;
 
 use asynchronous_codec::{Framed, FramedParts};
 use bytes::{Bytes, BytesMut};
 use futures::prelude::*;
-use libp2p_core::{PeerId, PublicKey};
+use libp2p_identity::{PeerId, PublicKey};
 use log::{debug, trace};
-use prost::Message;
+use quick_protobuf::{BytesReader, MessageRead, MessageWrite, Writer};
 use std::io::{Error as IoError, ErrorKind as IoErrorKind};
 use unsigned_varint::codec::UviBytes;
 
@@ -43,23 +43,23 @@ struct Local {
 }
 
 // HandshakeContext<Local> --with_remote-> HandshakeContext<Remote>
-pub struct Remote {
+pub(crate) struct Remote {
     // The remote's peer ID:
-    pub peer_id: PeerId,
-    // The remote's public key:
-    pub public_key: PublicKey,
+    pub(crate) peer_id: PeerId, // The remote's public key:
+    pub(crate) public_key: PublicKey,
 }
 
 impl HandshakeContext<Local> {
     fn new(config: PlainText2Config) -> Self {
         let exchange = Exchange {
             id: Some(config.local_public_key.to_peer_id().to_bytes()),
-            pubkey: Some(config.local_public_key.to_protobuf_encoding()),
+            pubkey: Some(config.local_public_key.encode_protobuf()),
         };
-        let mut buf = Vec::with_capacity(exchange.encoded_len());
+        let mut buf = Vec::with_capacity(exchange.get_size());
+        let mut writer = Writer::new(&mut buf);
         exchange
-            .encode(&mut buf)
-            .expect("Vec<u8> provides capacity as needed");
+            .write_message(&mut writer)
+            .expect("Encoding to succeed");
 
         Self {
             config,
@@ -73,34 +73,15 @@ impl HandshakeContext<Local> {
         self,
         exchange_bytes: BytesMut,
     ) -> Result<HandshakeContext<Remote>, PlainTextError> {
-        let prop = match Exchange::decode(exchange_bytes) {
-            Ok(prop) => prop,
-            Err(e) => {
-                debug!("failed to parse remote's exchange protobuf message");
-                return Err(PlainTextError::InvalidPayload(Some(e)));
-            }
-        };
+        let mut reader = BytesReader::from_bytes(&exchange_bytes);
+        let prop = Exchange::from_reader(&mut reader, &exchange_bytes).map_err(DecodeError)?;
 
-        let pb_pubkey = prop.pubkey.unwrap_or_default();
-        let public_key = match PublicKey::from_protobuf_encoding(pb_pubkey.as_slice()) {
-            Ok(p) => p,
-            Err(_) => {
-                debug!("failed to parse remote's exchange's pubkey protobuf");
-                return Err(PlainTextError::InvalidPayload(None));
-            }
-        };
-        let peer_id = match PeerId::from_bytes(&prop.id.unwrap_or_default()) {
-            Ok(p) => p,
-            Err(_) => {
-                debug!("failed to parse remote's exchange's id protobuf");
-                return Err(PlainTextError::InvalidPayload(None));
-            }
-        };
+        let public_key = PublicKey::try_decode_protobuf(&prop.pubkey.unwrap_or_default())?;
+        let peer_id = PeerId::from_bytes(&prop.id.unwrap_or_default())?;
 
         // Check the validity of the remote's `Exchange`.
         if peer_id != public_key.to_peer_id() {
-            debug!("the remote's `PeerId` isn't consistent with the remote's public key");
-            return Err(PlainTextError::InvalidPeerId);
+            return Err(PlainTextError::PeerIdMismatch);
         }
 
         Ok(HandshakeContext {
@@ -113,7 +94,7 @@ impl HandshakeContext<Local> {
     }
 }
 
-pub async fn handshake<S>(
+pub(crate) async fn handshake<S>(
     socket: S,
     config: PlainText2Config,
 ) -> Result<(S, Remote, Bytes), PlainTextError>

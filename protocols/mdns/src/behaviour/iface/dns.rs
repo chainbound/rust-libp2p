@@ -21,7 +21,8 @@
 //! (M)DNS encoding and decoding on top of the `dns_parser` library.
 
 use crate::{META_QUERY_SERVICE, SERVICE_NAME};
-use libp2p_core::{Multiaddr, PeerId};
+use libp2p_core::Multiaddr;
+use libp2p_identity::PeerId;
 use rand::distributions::Alphanumeric;
 use rand::{thread_rng, Rng};
 use std::{borrow::Cow, cmp, error, fmt, str, time::Duration};
@@ -46,11 +47,10 @@ const MAX_PACKET_SIZE: usize = 9000 - 68;
 const MAX_RECORDS_PER_PACKET: usize = (MAX_PACKET_SIZE - 100) / MAX_TXT_RECORD_SIZE;
 
 /// An encoded MDNS packet.
-pub type MdnsPacket = Vec<u8>;
-
+pub(crate) type MdnsPacket = Vec<u8>;
 /// Decodes a `<character-string>` (as defined by RFC1035) into a `Vec` of ASCII characters.
 // TODO: better error type?
-pub fn decode_character_string(mut from: &[u8]) -> Result<Cow<'_, [u8]>, ()> {
+pub(crate) fn decode_character_string(mut from: &[u8]) -> Result<Cow<'_, [u8]>, ()> {
     if from.is_empty() {
         return Ok(Cow::Owned(Vec::new()));
     }
@@ -69,7 +69,7 @@ pub fn decode_character_string(mut from: &[u8]) -> Result<Cow<'_, [u8]>, ()> {
 }
 
 /// Builds the binary representation of a DNS query to send on the network.
-pub fn build_query() -> MdnsPacket {
+pub(crate) fn build_query() -> MdnsPacket {
     let mut out = Vec::with_capacity(33);
 
     // Program-generated transaction ID; unused by our implementation.
@@ -103,10 +103,10 @@ pub fn build_query() -> MdnsPacket {
 /// Builds the response to an address discovery DNS query.
 ///
 /// If there are more than 2^16-1 addresses, ignores the rest.
-pub fn build_query_response(
+pub(crate) fn build_query_response<'a>(
     id: u16,
     peer_id: PeerId,
-    addresses: impl ExactSizeIterator<Item = Multiaddr>,
+    addresses: impl ExactSizeIterator<Item = &'a Multiaddr>,
     ttl: Duration,
 ) -> Vec<MdnsPacket> {
     // Convert the TTL into seconds.
@@ -165,7 +165,7 @@ pub fn build_query_response(
 }
 
 /// Builds the response to a service discovery DNS query.
-pub fn build_service_discovery_response(id: u16, ttl: Duration) -> MdnsPacket {
+pub(crate) fn build_service_discovery_response(id: u16, ttl: Duration) -> MdnsPacket {
     // Convert the TTL into seconds.
     let ttl = duration_to_secs(ttl);
 
@@ -395,14 +395,14 @@ impl error::Error for MdnsResponseError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dns_parser::Packet;
-    use libp2p_core::identity;
+    use libp2p_identity as identity;
     use std::time::Duration;
+    use trust_dns_proto::op::Message;
 
     #[test]
     fn build_query_correct() {
         let query = build_query();
-        assert!(Packet::parse(&query).is_ok());
+        assert!(Message::from_vec(&query).is_ok());
     }
 
     #[test]
@@ -413,18 +413,18 @@ mod tests {
         let packets = build_query_response(
             0xf8f8,
             my_peer_id,
-            vec![addr1, addr2].into_iter(),
+            vec![&addr1, &addr2].into_iter(),
             Duration::from_secs(60),
         );
         for packet in packets {
-            assert!(Packet::parse(&packet).is_ok());
+            assert!(Message::from_vec(&packet).is_ok());
         }
     }
 
     #[test]
     fn build_service_discovery_response_correct() {
         let query = build_service_discovery_response(0x1234, Duration::from_secs(120));
-        assert!(Packet::parse(&query).is_ok());
+        assert!(Message::from_vec(&query).is_ok());
     }
 
     #[test]

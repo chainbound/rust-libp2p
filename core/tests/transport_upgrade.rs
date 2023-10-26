@@ -19,11 +19,11 @@
 // DEALINGS IN THE SOFTWARE.
 
 use futures::prelude::*;
-use libp2p::core::identity;
-use libp2p::core::transport::{MemoryTransport, Transport};
-use libp2p::core::upgrade::{self, InboundUpgrade, OutboundUpgrade, UpgradeInfo};
-use libp2p::mplex::MplexConfig;
-use libp2p::noise;
+use libp2p_core::transport::{ListenerId, MemoryTransport, Transport};
+use libp2p_core::upgrade::{self, InboundUpgrade, OutboundUpgrade, UpgradeInfo};
+use libp2p_identity as identity;
+use libp2p_mplex::MplexConfig;
+use libp2p_noise as noise;
 use multiaddr::{Multiaddr, Protocol};
 use rand::random;
 use std::{io, pin::Pin};
@@ -81,7 +81,7 @@ fn upgrade_pipeline() {
     let listener_id = listener_keys.public().to_peer_id();
     let mut listener_transport = MemoryTransport::default()
         .upgrade(upgrade::Version::V1)
-        .authenticate(noise::NoiseAuthenticated::xx(&listener_keys).unwrap())
+        .authenticate(noise::Config::new(&listener_keys).unwrap())
         .apply(HelloUpgrade {})
         .apply(HelloUpgrade {})
         .apply(HelloUpgrade {})
@@ -92,7 +92,7 @@ fn upgrade_pipeline() {
     let dialer_id = dialer_keys.public().to_peer_id();
     let mut dialer_transport = MemoryTransport::default()
         .upgrade(upgrade::Version::V1)
-        .authenticate(noise::NoiseAuthenticated::xx(&dialer_keys).unwrap())
+        .authenticate(noise::Config::new(&dialer_keys).unwrap())
         .apply(HelloUpgrade {})
         .apply(HelloUpgrade {})
         .apply(HelloUpgrade {})
@@ -102,7 +102,9 @@ fn upgrade_pipeline() {
     let listen_addr1 = Multiaddr::from(Protocol::Memory(random::<u64>()));
     let listen_addr2 = listen_addr1.clone();
 
-    listener_transport.listen_on(listen_addr1).unwrap();
+    listener_transport
+        .listen_on(ListenerId::next(), listen_addr1)
+        .unwrap();
 
     let server = async move {
         loop {

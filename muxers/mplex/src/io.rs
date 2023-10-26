@@ -35,8 +35,7 @@ use std::{
     task::{Context, Poll, Waker},
 };
 
-pub use std::io::{Error, ErrorKind, Result};
-
+pub(crate) use std::io::{Error, Result};
 /// A connection identifier.
 ///
 /// Randomly generated and mainly intended to improve log output
@@ -56,7 +55,7 @@ impl fmt::Display for ConnectionId {
     }
 }
 /// A multiplexed I/O stream.
-pub struct Multiplexed<C> {
+pub(crate) struct Multiplexed<C> {
     /// A unique ID for the multiplexed stream (i.e. connection).
     id: ConnectionId,
     /// The current operating status of the multiplex stream.
@@ -116,7 +115,7 @@ where
     C: AsyncRead + AsyncWrite + Unpin,
 {
     /// Creates a new multiplexed I/O stream.
-    pub fn new(io: C, config: MplexConfig) -> Self {
+    pub(crate) fn new(io: C, config: MplexConfig) -> Self {
         let id = ConnectionId(rand::random());
         debug!("New multiplexed connection: {}", id);
         Multiplexed {
@@ -144,7 +143,7 @@ where
     }
 
     /// Flushes the underlying I/O stream.
-    pub fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    pub(crate) fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match &self.status {
             Status::Closed => return Poll::Ready(Ok(())),
             Status::Err(e) => return Poll::Ready(Err(io::Error::new(e.kind(), e.to_string()))),
@@ -170,7 +169,7 @@ where
     /// > **Note**: No `Close` or `Reset` frames are sent on open substreams
     /// > before closing the underlying connection. However, the connection
     /// > close implies a flush of any frames already sent.
-    pub fn poll_close(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    pub(crate) fn poll_close(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match &self.status {
             Status::Closed => return Poll::Ready(Ok(())),
             Status::Err(e) => return Poll::Ready(Err(io::Error::new(e.kind(), e.to_string()))),
@@ -209,7 +208,10 @@ where
     /// [`MaxBufferBehaviour::Block`] is used, this method is blocked
     /// (i.e. `Pending`) on some task reading from the substream whose
     /// buffer is full.
-    pub fn poll_next_stream(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<LocalStreamId>> {
+    pub(crate) fn poll_next_stream(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<LocalStreamId>> {
         self.guard_open()?;
 
         // Try to read from the buffer first.
@@ -250,7 +252,10 @@ where
     }
 
     /// Creates a new (outbound) substream, returning the allocated stream ID.
-    pub fn poll_open_stream(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<LocalStreamId>> {
+    pub(crate) fn poll_open_stream(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<LocalStreamId>> {
         self.guard_open()?;
 
         // Check the stream limits.
@@ -317,7 +322,7 @@ where
     /// > **Note**: All substreams obtained via `poll_next_stream`
     /// > or `poll_open_stream` must eventually be "dropped" by
     /// > calling this method when they are no longer used.
-    pub fn drop_stream(&mut self, id: LocalStreamId) {
+    pub(crate) fn drop_stream(&mut self, id: LocalStreamId) {
         // Check if the underlying stream is ok.
         match self.status {
             Status::Closed | Status::Err(_) => return,
@@ -367,7 +372,7 @@ where
     }
 
     /// Writes data to a substream.
-    pub fn poll_write_stream(
+    pub(crate) fn poll_write_stream(
         &mut self,
         cx: &mut Context<'_>,
         id: LocalStreamId,
@@ -417,7 +422,7 @@ where
     /// and under consideration of the number of already used substreams,
     /// thereby waking the task that last called `poll_next_stream`, if any.
     /// Inbound substreams received in excess of that limit are immediately reset.
-    pub fn poll_read_stream(
+    pub(crate) fn poll_read_stream(
         &mut self,
         cx: &mut Context<'_>,
         id: LocalStreamId,
@@ -509,7 +514,7 @@ where
     /// > **Note**: This is equivalent to `poll_flush()`, i.e. to flushing
     /// > all substreams, except that this operation returns an error if
     /// > the underlying I/O stream is already closed.
-    pub fn poll_flush_stream(
+    pub(crate) fn poll_flush_stream(
         &mut self,
         cx: &mut Context<'_>,
         id: LocalStreamId,
@@ -525,7 +530,7 @@ where
     /// Closes a stream for writing.
     ///
     /// > **Note**: As opposed to `poll_close()`, a flush it not implied.
-    pub fn poll_close_stream(
+    pub(crate) fn poll_close_stream(
         &mut self,
         cx: &mut Context<'_>,
         id: LocalStreamId,
@@ -1220,7 +1225,7 @@ mod tests {
                 for i in 0..cfg.max_substreams {
                     match m.poll_next_stream(cx) {
                         Poll::Pending => panic!("Expected new inbound stream."),
-                        Poll::Ready(Err(e)) => panic!("{:?}", e),
+                        Poll::Ready(Err(e)) => panic!("{e:?}"),
                         Poll::Ready(Ok(id)) => {
                             assert_eq!(id, LocalStreamId::listener(i as u64));
                         }
@@ -1231,7 +1236,7 @@ mod tests {
                 // after reading and buffering data frames up to the limit.
                 let id = LocalStreamId::listener(0);
                 match m.poll_next_stream(cx) {
-                    Poll::Ready(r) => panic!("Unexpected result for next stream: {:?}", r),
+                    Poll::Ready(r) => panic!("Unexpected result for next stream: {r:?}"),
                     Poll::Pending => {
                         // We expect the implementation to yield when the buffer
                         // is full but before it is exceeded and the max buffer
@@ -1243,7 +1248,7 @@ mod tests {
                             cfg.max_buffer_len
                         );
                         match m.poll_next_stream(cx) {
-                            Poll::Ready(r) => panic!("Unexpected result for next stream: {:?}", r),
+                            Poll::Ready(r) => panic!("Unexpected result for next stream: {r:?}"),
                             Poll::Pending => {
                                 // Expect the buffer for stream 0 to be exceeded, triggering
                                 // the max. buffer behaviour.
@@ -1281,7 +1286,7 @@ mod tests {
                         Poll::Ready(Ok(Some(bytes))) => {
                             assert_eq!(bytes, data);
                         }
-                        x => panic!("Unexpected: {:?}", x),
+                        x => panic!("Unexpected: {x:?}"),
                     }
                 }
 
@@ -1293,7 +1298,7 @@ mod tests {
                         // Expect to read EOF
                         match m.poll_read_stream(cx, id) {
                             Poll::Ready(Ok(None)) => {}
-                            poll => panic!("Unexpected: {:?}", poll),
+                            poll => panic!("Unexpected: {poll:?}"),
                         }
                     }
                     MaxBufferBehaviour::Block => {
@@ -1301,7 +1306,7 @@ mod tests {
                         match m.poll_read_stream(cx, id) {
                             Poll::Ready(Ok(Some(bytes))) => assert_eq!(bytes, data),
                             Poll::Pending => assert_eq!(overflow.get(), 1),
-                            poll => panic!("Unexpected: {:?}", poll),
+                            poll => panic!("Unexpected: {poll:?}"),
                         }
                     }
                 }

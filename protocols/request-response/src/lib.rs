@@ -22,52 +22,70 @@
 //!
 //! ## General Usage
 //!
-//! [`RequestResponse`] is a `NetworkBehaviour` that implements a generic
+//! The [`Behaviour`] struct is a [`NetworkBehaviour`] that implements a generic
 //! request/response protocol or protocol family, whereby each request is
-//! sent over a new substream on a connection. `RequestResponse` is generic
+//! sent over a new substream on a connection. `Behaviour` is generic
 //! over the actual messages being sent, which are defined in terms of a
-//! [`RequestResponseCodec`]. Creating a request/response protocol thus amounts
+//! [`Codec`]. Creating a request/response protocol thus amounts
 //! to providing an implementation of this trait which can then be
-//! given to [`RequestResponse::new`]. Further configuration options are
-//! available via the [`RequestResponseConfig`].
+//! given to [`Behaviour::with_codec`]. Further configuration options are
+//! available via the [`Config`].
 //!
-//! Requests are sent using [`RequestResponse::send_request`] and the
-//! responses received as [`RequestResponseMessage::Response`] via
-//! [`RequestResponseEvent::Message`].
+//! Requests are sent using [`Behaviour::send_request`] and the
+//! responses received as [`Message::Response`] via
+//! [`Event::Message`].
 //!
-//! Responses are sent using [`RequestResponse::send_response`] upon
-//! receiving a [`RequestResponseMessage::Request`] via
-//! [`RequestResponseEvent::Message`].
+//! Responses are sent using [`Behaviour::send_response`] upon
+//! receiving a [`Message::Request`] via
+//! [`Event::Message`].
+//!
+//! ## Predefined codecs
+//!
+//! In case your message types implement [`serde::Serialize`] and [`serde::Deserialize`],
+//! you can use two predefined behaviours:
+//!
+//! - [`cbor::Behaviour`] for CBOR-encoded messages
+//! - [`json::Behaviour`] for JSON-encoded messages
 //!
 //! ## Protocol Families
 //!
-//! A single [`RequestResponse`] instance can be used with an entire
+//! A single [`Behaviour`] instance can be used with an entire
 //! protocol family that share the same request and response types.
-//! For that purpose, [`RequestResponseCodec::Protocol`] is typically
+//! For that purpose, [`Codec::Protocol`] is typically
 //! instantiated with a sum type.
 //!
 //! ## Limited Protocol Support
 //!
 //! It is possible to only support inbound or outbound requests for
-//! a particular protocol. This is achieved by instantiating `RequestResponse`
+//! a particular protocol. This is achieved by instantiating `Behaviour`
 //! with protocols using [`ProtocolSupport::Inbound`] or
 //! [`ProtocolSupport::Outbound`]. Any subset of protocols of a protocol
 //! family can be configured in this way. Such protocols will not be
 //! advertised during inbound respectively outbound protocol negotiation
 //! on the substreams.
 
-pub mod codec;
-pub mod handler;
+#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
 
-pub use codec::{ProtocolName, RequestResponseCodec};
+#[cfg(feature = "cbor")]
+pub mod cbor;
+mod codec;
+mod handler;
+#[cfg(feature = "json")]
+pub mod json;
+
+pub use codec::Codec;
 pub use handler::ProtocolSupport;
 
+use crate::handler::protocol::RequestProtocol;
 use futures::channel::oneshot;
-use handler::{RequestProtocol, RequestResponseHandler, RequestResponseHandlerEvent};
-use libp2p_core::{connection::ConnectionId, ConnectedPoint, Multiaddr, PeerId};
+use handler::Handler;
+use libp2p_core::{ConnectedPoint, Endpoint, Multiaddr};
+use libp2p_identity::PeerId;
 use libp2p_swarm::{
-    dial_opts::DialOpts, DialError, IntoConnectionHandler, NetworkBehaviour,
-    NetworkBehaviourAction, NotifyHandler, PollParameters,
+    behaviour::{AddressChange, ConnectionClosed, ConnectionEstablished, DialFailure, FromSwarm},
+    dial_opts::DialOpts,
+    ConnectionDenied, ConnectionId, NetworkBehaviour, NotifyHandler, PollParameters, THandler,
+    THandlerInEvent, THandlerOutEvent, ToSwarm,
 };
 use smallvec::SmallVec;
 use std::{
@@ -80,7 +98,7 @@ use std::{
 
 /// An inbound request or response.
 #[derive(Debug)]
-pub enum RequestResponseMessage<TRequest, TResponse, TChannelResponse = TResponse> {
+pub enum Message<TRequest, TResponse, TChannelResponse = TResponse> {
     /// A request message.
     Request {
         /// The ID of this request.
@@ -90,7 +108,7 @@ pub enum RequestResponseMessage<TRequest, TResponse, TChannelResponse = TRespons
         /// The channel waiting for the response.
         ///
         /// If this channel is dropped instead of being used to send a response
-        /// via [`RequestResponse::send_response`], a [`RequestResponseEvent::InboundFailure`]
+        /// via [`Behaviour::send_response`], a [`Event::InboundFailure`]
         /// with [`InboundFailure::ResponseOmission`] is emitted.
         channel: ResponseChannel<TChannelResponse>,
     },
@@ -98,22 +116,22 @@ pub enum RequestResponseMessage<TRequest, TResponse, TChannelResponse = TRespons
     Response {
         /// The ID of the request that produced this response.
         ///
-        /// See [`RequestResponse::send_request`].
+        /// See [`Behaviour::send_request`].
         request_id: RequestId,
         /// The response message.
         response: TResponse,
     },
 }
 
-/// The events emitted by a [`RequestResponse`] protocol.
+/// The events emitted by a request-response [`Behaviour`].
 #[derive(Debug)]
-pub enum RequestResponseEvent<TRequest, TResponse, TChannelResponse = TResponse> {
+pub enum Event<TRequest, TResponse, TChannelResponse = TResponse> {
     /// An incoming message (request or response).
     Message {
         /// The peer who sent the message.
         peer: PeerId,
         /// The incoming message.
-        message: RequestResponseMessage<TRequest, TResponse, TChannelResponse>,
+        message: Message<TRequest, TResponse, TChannelResponse>,
     },
     /// An outbound request failed.
     OutboundFailure {
@@ -188,7 +206,7 @@ impl std::error::Error for OutboundFailure {}
 pub enum InboundFailure {
     /// The inbound request timed out, either while reading the
     /// incoming request or before a response is sent, e.g. if
-    /// [`RequestResponse::send_response`] is not called in a
+    /// [`Behaviour::send_response`] is not called in a
     /// timely manner.
     Timeout,
     /// The connection closed before a response could be send.
@@ -198,7 +216,7 @@ pub enum InboundFailure {
     UnsupportedProtocols,
     /// The local peer failed to respond to an inbound request
     /// due to the [`ResponseChannel`] being dropped instead of
-    /// being passed to [`RequestResponse::send_response`].
+    /// being passed to [`Behaviour::send_response`].
     ResponseOmission,
 }
 
@@ -227,7 +245,7 @@ impl std::error::Error for InboundFailure {}
 
 /// A channel for sending a response to an inbound request.
 ///
-/// See [`RequestResponse::send_response`].
+/// See [`Behaviour::send_response`].
 #[derive(Debug)]
 pub struct ResponseChannel<TResponse> {
     sender: oneshot::Sender<TResponse>,
@@ -235,8 +253,8 @@ pub struct ResponseChannel<TResponse> {
 
 impl<TResponse> ResponseChannel<TResponse> {
     /// Checks whether the response channel is still open, i.e.
-    /// the `RequestResponse` behaviour is still waiting for a
-    /// a response to be sent via [`RequestResponse::send_response`]
+    /// the `Behaviour` is still waiting for a
+    /// a response to be sent via [`Behaviour::send_response`]
     /// and this response channel.
     ///
     /// If the response channel is no longer open then the inbound
@@ -252,7 +270,7 @@ impl<TResponse> ResponseChannel<TResponse> {
 /// inbound and likewise between two outbound requests. There is no
 /// uniqueness guarantee in a set of both inbound and outbound
 /// [`RequestId`]s nor in a set of inbound or outbound requests
-/// originating from different [`RequestResponse`] behaviours.
+/// originating from different [`Behaviour`]'s.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub struct RequestId(u64);
 
@@ -262,14 +280,14 @@ impl fmt::Display for RequestId {
     }
 }
 
-/// The configuration for a `RequestResponse` protocol.
+/// The configuration for a `Behaviour` protocol.
 #[derive(Debug, Clone)]
-pub struct RequestResponseConfig {
+pub struct Config {
     request_timeout: Duration,
     connection_keep_alive: Duration,
 }
 
-impl Default for RequestResponseConfig {
+impl Default for Config {
     fn default() -> Self {
         Self {
             connection_keep_alive: Duration::from_secs(10),
@@ -278,7 +296,7 @@ impl Default for RequestResponseConfig {
     }
 }
 
-impl RequestResponseConfig {
+impl Config {
     /// Sets the keep-alive timeout of idle connections.
     pub fn set_connection_keep_alive(&mut self, v: Duration) -> &mut Self {
         self.connection_keep_alive = v;
@@ -293,9 +311,9 @@ impl RequestResponseConfig {
 }
 
 /// A request/response protocol for some message codec.
-pub struct RequestResponse<TCodec>
+pub struct Behaviour<TCodec>
 where
-    TCodec: RequestResponseCodec + Clone + Send + 'static,
+    TCodec: Codec + Clone + Send + 'static,
 {
     /// The supported inbound protocols.
     inbound_protocols: SmallVec<[TCodec::Protocol; 2]>,
@@ -306,16 +324,12 @@ where
     /// The next (inbound) request ID.
     next_inbound_id: Arc<AtomicU64>,
     /// The protocol configuration.
-    config: RequestResponseConfig,
+    config: Config,
     /// The protocol codec for reading and writing requests and responses.
     codec: TCodec,
     /// Pending events to return from `poll`.
-    pending_events: VecDeque<
-        NetworkBehaviourAction<
-            RequestResponseEvent<TCodec::Request, TCodec::Response>,
-            RequestResponseHandler<TCodec>,
-        >,
-    >,
+    pending_events:
+        VecDeque<ToSwarm<Event<TCodec::Request, TCodec::Response>, RequestProtocol<TCodec>>>,
     /// The currently connected peers, their pending outbound and inbound responses and their known,
     /// reachable addresses, if any.
     connected: HashMap<PeerId, SmallVec<[Connection; 2]>>,
@@ -326,13 +340,26 @@ where
     pending_outbound_requests: HashMap<PeerId, SmallVec<[RequestProtocol<TCodec>; 10]>>,
 }
 
-impl<TCodec> RequestResponse<TCodec>
+impl<TCodec> Behaviour<TCodec>
 where
-    TCodec: RequestResponseCodec + Clone + Send + 'static,
+    TCodec: Codec + Default + Clone + Send + 'static,
 {
-    /// Creates a new `RequestResponse` behaviour for the given
+    /// Creates a new `Behaviour` for the given protocols and configuration, using [`Default`] to construct the codec.
+    pub fn new<I>(protocols: I, cfg: Config) -> Self
+    where
+        I: IntoIterator<Item = (TCodec::Protocol, ProtocolSupport)>,
+    {
+        Self::with_codec(TCodec::default(), protocols, cfg)
+    }
+}
+
+impl<TCodec> Behaviour<TCodec>
+where
+    TCodec: Codec + Clone + Send + 'static,
+{
+    /// Creates a new `Behaviour` for the given
     /// protocols, codec and configuration.
-    pub fn new<I>(codec: TCodec, protocols: I, cfg: RequestResponseConfig) -> Self
+    pub fn with_codec<I>(codec: TCodec, protocols: I, cfg: Config) -> Self
     where
         I: IntoIterator<Item = (TCodec::Protocol, ProtocolSupport)>,
     {
@@ -346,7 +373,7 @@ where
                 outbound_protocols.push(p.clone());
             }
         }
-        RequestResponse {
+        Behaviour {
             inbound_protocols,
             outbound_protocols,
             next_request_id: RequestId(1),
@@ -370,8 +397,8 @@ where
     /// > the `RequestResonse` protocol must either be embedded
     /// > in another `NetworkBehaviour` that provides peer and
     /// > address discovery, or known addresses of peers must be
-    /// > managed via [`RequestResponse::add_address`] and
-    /// > [`RequestResponse::remove_address`].
+    /// > managed via [`Behaviour::add_address`] and
+    /// > [`Behaviour::remove_address`].
     pub fn send_request(&mut self, peer: &PeerId, request: TCodec::Request) -> RequestId {
         let request_id = self.next_request_id();
         let request = RequestProtocol {
@@ -382,10 +409,8 @@ where
         };
 
         if let Some(request) = self.try_send_request(peer, request) {
-            let handler = self.new_handler();
-            self.pending_events.push_back(NetworkBehaviourAction::Dial {
+            self.pending_events.push_back(ToSwarm::Dial {
                 opts: DialOpts::peer_id(*peer).build(),
-                handler,
             });
             self.pending_outbound_requests
                 .entry(*peer)
@@ -401,12 +426,12 @@ where
     /// If the [`ResponseChannel`] is already closed due to a timeout or the
     /// connection being closed, the response is returned as an `Err` for
     /// further handling. Once the response has been successfully sent on the
-    /// corresponding connection, [`RequestResponseEvent::ResponseSent`] is
-    /// emitted. In all other cases [`RequestResponseEvent::InboundFailure`]
+    /// corresponding connection, [`Event::ResponseSent`] is
+    /// emitted. In all other cases [`Event::InboundFailure`]
     /// will be or has been emitted.
     ///
     /// The provided `ResponseChannel` is obtained from an inbound
-    /// [`RequestResponseMessage::Request`].
+    /// [`Message::Request`].
     pub fn send_response(
         &mut self,
         ch: ResponseChannel<TCodec::Response>,
@@ -417,7 +442,7 @@ where
 
     /// Adds a known address for a peer that can be used for
     /// dialing attempts by the `Swarm`, i.e. is returned
-    /// by [`NetworkBehaviour::addresses_of_peer`].
+    /// by [`NetworkBehaviour::handle_pending_outbound_connection`].
     ///
     /// Addresses added in this way are only removed by `remove_address`.
     pub fn add_address(&mut self, peer: &PeerId, address: Multiaddr) {
@@ -446,7 +471,7 @@ where
     }
 
     /// Checks whether an outbound request to the peer with the provided
-    /// [`PeerId`] initiated by [`RequestResponse::send_request`] is still
+    /// [`PeerId`] initiated by [`Behaviour::send_request`] is still
     /// pending, i.e. waiting for a response.
     pub fn is_pending_outbound(&self, peer: &PeerId, request_id: &RequestId) -> bool {
         // Check if request is already sent on established connection.
@@ -470,7 +495,7 @@ where
 
     /// Checks whether an inbound request from the peer with the provided
     /// [`PeerId`] is still pending, i.e. waiting for a response by the local
-    /// node through [`RequestResponse::send_response`].
+    /// node through [`Behaviour::send_response`].
     pub fn is_pending_inbound(&self, peer: &PeerId, request_id: &RequestId) -> bool {
         self.connected
             .get(peer)
@@ -503,12 +528,11 @@ where
             let ix = (request.request_id.0 as usize) % connections.len();
             let conn = &mut connections[ix];
             conn.pending_inbound_responses.insert(request.request_id);
-            self.pending_events
-                .push_back(NetworkBehaviourAction::NotifyHandler {
-                    peer_id: *peer,
-                    handler: NotifyHandler::One(conn.id),
-                    event: request,
-                });
+            self.pending_events.push_back(ToSwarm::NotifyHandler {
+                peer_id: *peer,
+                handler: NotifyHandler::One(conn.id),
+                event: request,
+            });
             None
         } else {
             Some(request)
@@ -558,42 +582,15 @@ where
             .get_mut(peer)
             .and_then(|connections| connections.iter_mut().find(|c| c.id == connection))
     }
-}
 
-impl<TCodec> NetworkBehaviour for RequestResponse<TCodec>
-where
-    TCodec: RequestResponseCodec + Send + Clone + 'static,
-{
-    type ConnectionHandler = RequestResponseHandler<TCodec>;
-    type OutEvent = RequestResponseEvent<TCodec::Request, TCodec::Response>;
-
-    fn new_handler(&mut self) -> Self::ConnectionHandler {
-        RequestResponseHandler::new(
-            self.inbound_protocols.clone(),
-            self.codec.clone(),
-            self.config.connection_keep_alive,
-            self.config.request_timeout,
-            self.next_inbound_id.clone(),
-        )
-    }
-
-    fn addresses_of_peer(&mut self, peer: &PeerId) -> Vec<Multiaddr> {
-        let mut addresses = Vec::new();
-        if let Some(connections) = self.connected.get(peer) {
-            addresses.extend(connections.iter().filter_map(|c| c.address.clone()))
-        }
-        if let Some(more) = self.addresses.get(peer) {
-            addresses.extend(more.into_iter().cloned());
-        }
-        addresses
-    }
-
-    fn inject_address_change(
+    fn on_address_change(
         &mut self,
-        peer: &PeerId,
-        conn: &ConnectionId,
-        _old: &ConnectedPoint,
-        new: &ConnectedPoint,
+        AddressChange {
+            peer_id,
+            connection_id,
+            new,
+            ..
+        }: AddressChange,
     ) {
         let new_address = match new {
             ConnectedPoint::Dialer { address, .. } => Some(address.clone()),
@@ -601,97 +598,91 @@ where
         };
         let connections = self
             .connected
-            .get_mut(peer)
+            .get_mut(&peer_id)
             .expect("Address change can only happen on an established connection.");
 
         let connection = connections
             .iter_mut()
-            .find(|c| &c.id == conn)
+            .find(|c| c.id == connection_id)
             .expect("Address change can only happen on an established connection.");
         connection.address = new_address;
     }
 
-    fn inject_connection_established(
+    fn on_connection_established(
         &mut self,
-        peer: &PeerId,
-        conn: &ConnectionId,
-        endpoint: &ConnectedPoint,
-        _errors: Option<&Vec<Multiaddr>>,
-        other_established: usize,
+        ConnectionEstablished {
+            peer_id,
+            connection_id,
+            endpoint,
+            other_established,
+            ..
+        }: ConnectionEstablished,
     ) {
         let address = match endpoint {
             ConnectedPoint::Dialer { address, .. } => Some(address.clone()),
             ConnectedPoint::Listener { .. } => None,
         };
         self.connected
-            .entry(*peer)
+            .entry(peer_id)
             .or_default()
-            .push(Connection::new(*conn, address));
+            .push(Connection::new(connection_id, address));
 
         if other_established == 0 {
-            if let Some(pending) = self.pending_outbound_requests.remove(peer) {
+            if let Some(pending) = self.pending_outbound_requests.remove(&peer_id) {
                 for request in pending {
-                    let request = self.try_send_request(peer, request);
+                    let request = self.try_send_request(&peer_id, request);
                     assert!(request.is_none());
                 }
             }
         }
     }
 
-    fn inject_connection_closed(
+    fn on_connection_closed(
         &mut self,
-        peer_id: &PeerId,
-        conn: &ConnectionId,
-        _: &ConnectedPoint,
-        _: <Self::ConnectionHandler as IntoConnectionHandler>::Handler,
-        remaining_established: usize,
+        ConnectionClosed {
+            peer_id,
+            connection_id,
+            remaining_established,
+            ..
+        }: ConnectionClosed<<Self as NetworkBehaviour>::ConnectionHandler>,
     ) {
         let connections = self
             .connected
-            .get_mut(peer_id)
+            .get_mut(&peer_id)
             .expect("Expected some established connection to peer before closing.");
 
         let connection = connections
             .iter()
-            .position(|c| &c.id == conn)
+            .position(|c| c.id == connection_id)
             .map(|p: usize| connections.remove(p))
             .expect("Expected connection to be established before closing.");
 
         debug_assert_eq!(connections.is_empty(), remaining_established == 0);
         if connections.is_empty() {
-            self.connected.remove(peer_id);
+            self.connected.remove(&peer_id);
         }
 
         for request_id in connection.pending_outbound_responses {
             self.pending_events
-                .push_back(NetworkBehaviourAction::GenerateEvent(
-                    RequestResponseEvent::InboundFailure {
-                        peer: *peer_id,
-                        request_id,
-                        error: InboundFailure::ConnectionClosed,
-                    },
-                ));
+                .push_back(ToSwarm::GenerateEvent(Event::InboundFailure {
+                    peer: peer_id,
+                    request_id,
+                    error: InboundFailure::ConnectionClosed,
+                }));
         }
 
         for request_id in connection.pending_inbound_responses {
             self.pending_events
-                .push_back(NetworkBehaviourAction::GenerateEvent(
-                    RequestResponseEvent::OutboundFailure {
-                        peer: *peer_id,
-                        request_id,
-                        error: OutboundFailure::ConnectionClosed,
-                    },
-                ));
+                .push_back(ToSwarm::GenerateEvent(Event::OutboundFailure {
+                    peer: peer_id,
+                    request_id,
+                    error: OutboundFailure::ConnectionClosed,
+                }));
         }
     }
 
-    fn inject_dial_failure(
-        &mut self,
-        peer: Option<PeerId>,
-        _: Self::ConnectionHandler,
-        _: &DialError,
-    ) {
-        if let Some(peer) = peer {
+    fn on_dial_failure(&mut self, DialFailure { peer_id, .. }: DialFailure) {
+        if let Some(peer) = peer_id {
             // If there are pending outgoing requests when a dial failure occurs,
             // it is implied that we are not connected to the peer, since pending
             // outgoing requests are drained when a connection is established and
@@ -701,26 +692,109 @@ where
             if let Some(pending) = self.pending_outbound_requests.remove(&peer) {
                 for request in pending {
                     self.pending_events
-                        .push_back(NetworkBehaviourAction::GenerateEvent(
-                            RequestResponseEvent::OutboundFailure {
-                                peer,
-                                request_id: request.request_id,
-                                error: OutboundFailure::DialFailure,
-                            },
-                        ));
+                        .push_back(ToSwarm::GenerateEvent(Event::OutboundFailure {
+                            peer,
+                            request_id: request.request_id,
+                            error: OutboundFailure::DialFailure,
+                        }));
                 }
             }
         }
     }
+}
 
-    fn inject_event(
+impl<TCodec> NetworkBehaviour for Behaviour<TCodec>
+where
+    TCodec: Codec + Send + Clone + 'static,
+{
+    type ConnectionHandler = Handler<TCodec>;
+    type ToSwarm = Event<TCodec::Request, TCodec::Response>;
+
+    fn handle_established_inbound_connection(
+        &mut self,
+        _: ConnectionId,
+        _: PeerId,
+        _: &Multiaddr,
+        _: &Multiaddr,
+    ) -> Result<THandler<Self>, ConnectionDenied> {
+        Ok(Handler::new(
+            self.inbound_protocols.clone(),
+            self.codec.clone(),
+            self.config.connection_keep_alive,
+            self.config.request_timeout,
+            self.next_inbound_id.clone(),
+        ))
+    }
+
+    fn handle_pending_outbound_connection(
+        &mut self,
+        _connection_id: ConnectionId,
+        maybe_peer: Option<PeerId>,
+        _addresses: &[Multiaddr],
+        _effective_role: Endpoint,
+    ) -> Result<Vec<Multiaddr>, ConnectionDenied> {
+        let peer = match maybe_peer {
+            None => return Ok(vec![]),
+            Some(peer) => peer,
+        };
+
+        let mut addresses = Vec::new();
+        if let Some(connections) = self.connected.get(&peer) {
+            addresses.extend(connections.iter().filter_map(|c| c.address.clone()))
+        }
+        if let Some(more) = self.addresses.get(&peer) {
+            addresses.extend(more.into_iter().cloned());
+        }
+
+        Ok(addresses)
+    }
+
+    fn handle_established_outbound_connection(
+        &mut self,
+        _: ConnectionId,
+        _: PeerId,
+        _: &Multiaddr,
+        _: Endpoint,
+    ) -> Result<THandler<Self>, ConnectionDenied> {
+        Ok(Handler::new(
+            self.inbound_protocols.clone(),
+            self.codec.clone(),
+            self.config.connection_keep_alive,
+            self.config.request_timeout,
+            self.next_inbound_id.clone(),
+        ))
+    }
+
+    fn on_swarm_event(&mut self, event: FromSwarm<Self::ConnectionHandler>) {
+        match event {
+            FromSwarm::ConnectionEstablished(connection_established) => {
+                self.on_connection_established(connection_established)
+            }
+            FromSwarm::ConnectionClosed(connection_closed) => {
+                self.on_connection_closed(connection_closed)
+            }
+            FromSwarm::AddressChange(address_change) => self.on_address_change(address_change),
+            FromSwarm::DialFailure(dial_failure) => self.on_dial_failure(dial_failure),
+            FromSwarm::ListenFailure(_) => {}
+            FromSwarm::NewListener(_) => {}
+            FromSwarm::NewListenAddr(_) => {}
+            FromSwarm::ExpiredListenAddr(_) => {}
+            FromSwarm::ListenerError(_) => {}
+            FromSwarm::ListenerClosed(_) => {}
+            FromSwarm::NewExternalAddrCandidate(_) => {}
+            FromSwarm::ExternalAddrExpired(_) => {}
+            FromSwarm::ExternalAddrConfirmed(_) => {}
+        }
+    }
+
+    fn on_connection_handler_event(
         &mut self,
         peer: PeerId,
         connection: ConnectionId,
-        event: RequestResponseHandlerEvent<TCodec>,
+        event: THandlerOutEvent<Self>,
     ) {
         match event {
-            RequestResponseHandlerEvent::Response {
+            handler::Event::Response {
                 request_id,
                 response,
             } => {
@@ -730,50 +804,45 @@ where
                     "Expect request_id to be pending before receiving response.",
                 );
 
-                let message = RequestResponseMessage::Response {
+                let message = Message::Response {
                     request_id,
                     response,
                 };
                 self.pending_events
-                    .push_back(NetworkBehaviourAction::GenerateEvent(
-                        RequestResponseEvent::Message { peer, message },
-                    ));
+                    .push_back(ToSwarm::GenerateEvent(Event::Message { peer, message }));
             }
-            RequestResponseHandlerEvent::Request {
+            handler::Event::Request {
                 request_id,
                 request,
                 sender,
             } => {
                 let channel = ResponseChannel { sender };
-                let message = RequestResponseMessage::Request {
+                let message = Message::Request {
                     request_id,
                     request,
                     channel,
                 };
                 self.pending_events
-                    .push_back(NetworkBehaviourAction::GenerateEvent(
-                        RequestResponseEvent::Message { peer, message },
-                    ));
+                    .push_back(ToSwarm::GenerateEvent(Event::Message { peer, message }));
 
                 match self.get_connection_mut(&peer, connection) {
                     Some(connection) => {
                         let inserted = connection.pending_outbound_responses.insert(request_id);
                         debug_assert!(inserted, "Expect id of new request to be unknown.");
                     }
-                    // Connection closed after `RequestResponseEvent::Request` has been emitted.
+                    // Connection closed after `Event::Request` has been emitted.
                     None => {
-                        self.pending_events
-                            .push_back(NetworkBehaviourAction::GenerateEvent(
-                                RequestResponseEvent::InboundFailure {
-                                    peer,
-                                    request_id,
-                                    error: InboundFailure::ConnectionClosed,
-                                },
-                            ));
+                        self.pending_events.push_back(ToSwarm::GenerateEvent(
+                            Event::InboundFailure {
+                                peer,
+                                request_id,
+                                error: InboundFailure::ConnectionClosed,
+                            },
+                        ));
                     }
                 }
             }
-            RequestResponseHandlerEvent::ResponseSent(request_id) => {
+            handler::Event::ResponseSent(request_id) => {
                 let removed = self.remove_pending_outbound_response(&peer, connection, request_id);
                 debug_assert!(
                     removed,
@@ -781,11 +850,12 @@ where
                 );
 
                 self.pending_events
-                    .push_back(NetworkBehaviourAction::GenerateEvent(
-                        RequestResponseEvent::ResponseSent { peer, request_id },
-                    ));
+                    .push_back(ToSwarm::GenerateEvent(Event::ResponseSent {
+                        peer,
+                        request_id,
+                    }));
             }
-            RequestResponseHandlerEvent::ResponseOmission(request_id) => {
+            handler::Event::ResponseOmission(request_id) => {
                 let removed = self.remove_pending_outbound_response(&peer, connection, request_id);
                 debug_assert!(
                     removed,
@@ -793,15 +863,13 @@ where
                 );
 
                 self.pending_events
-                    .push_back(NetworkBehaviourAction::GenerateEvent(
-                        RequestResponseEvent::InboundFailure {
-                            peer,
-                            request_id,
-                            error: InboundFailure::ResponseOmission,
-                        },
-                    ));
+                    .push_back(ToSwarm::GenerateEvent(Event::InboundFailure {
+                        peer,
+                        request_id,
+                        error: InboundFailure::ResponseOmission,
+                    }));
             }
-            RequestResponseHandlerEvent::OutboundTimeout(request_id) => {
+            handler::Event::OutboundTimeout(request_id) => {
                 let removed = self.remove_pending_inbound_response(&peer, connection, &request_id);
                 debug_assert!(
                     removed,
@@ -809,31 +877,13 @@ where
                 );
 
                 self.pending_events
-                    .push_back(NetworkBehaviourAction::GenerateEvent(
-                        RequestResponseEvent::OutboundFailure {
-                            peer,
-                            request_id,
-                            error: OutboundFailure::Timeout,
-                        },
-                    ));
+                    .push_back(ToSwarm::GenerateEvent(Event::OutboundFailure {
+                        peer,
+                        request_id,
+                        error: OutboundFailure::Timeout,
+                    }));
             }
-            RequestResponseHandlerEvent::InboundTimeout(request_id) => {
-                // Note: `RequestResponseHandlerEvent::InboundTimeout` is emitted both for timing
-                // out to receive the request and for timing out sending the response. In the former
-                // case the request is never added to `pending_outbound_responses` and thus one can
-                // not assert the request_id to be present before removing it.
-                self.remove_pending_outbound_response(&peer, connection, request_id);
-
-                self.pending_events
-                    .push_back(NetworkBehaviourAction::GenerateEvent(
-                        RequestResponseEvent::InboundFailure {
-                            peer,
-                            request_id,
-                            error: InboundFailure::Timeout,
-                        },
-                    ));
-            }
-            RequestResponseHandlerEvent::OutboundUnsupportedProtocols(request_id) => {
+            handler::Event::OutboundUnsupportedProtocols(request_id) => {
                 let removed = self.remove_pending_inbound_response(&peer, connection, &request_id);
                 debug_assert!(
                     removed,
@@ -841,26 +891,11 @@ where
                 );
 
                 self.pending_events
-                    .push_back(NetworkBehaviourAction::GenerateEvent(
-                        RequestResponseEvent::OutboundFailure {
-                            peer,
-                            request_id,
-                            error: OutboundFailure::UnsupportedProtocols,
-                        },
-                    ));
-            }
-            RequestResponseHandlerEvent::InboundUnsupportedProtocols(request_id) => {
-                // Note: No need to call `self.remove_pending_outbound_response`,
-                // `RequestResponseHandlerEvent::Request` was never emitted for this request and
-                // thus request was never added to `pending_outbound_responses`.
-                self.pending_events
-                    .push_back(NetworkBehaviourAction::GenerateEvent(
-                        RequestResponseEvent::InboundFailure {
-                            peer,
-                            request_id,
-                            error: InboundFailure::UnsupportedProtocols,
-                        },
-                    ));
+                    .push_back(ToSwarm::GenerateEvent(Event::OutboundFailure {
+                        peer,
+                        request_id,
+                        error: OutboundFailure::UnsupportedProtocols,
+                    }));
             }
         }
     }
@@ -869,7 +904,7 @@ where
         &mut self,
         _: &mut Context<'_>,
         _: &mut impl PollParameters,
-    ) -> Poll<NetworkBehaviourAction<Self::OutEvent, Self::ConnectionHandler>> {
+    ) -> Poll<ToSwarm<Self::ToSwarm, THandlerInEvent<Self>>> {
         if let Some(ev) = self.pending_events.pop_front() {
             return Poll::Ready(ev);
         } else if self.pending_events.capacity() > EMPTY_QUEUE_SHRINK_THRESHOLD {

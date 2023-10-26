@@ -32,13 +32,15 @@
 //! module.
 //!
 
+#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
+
 use futures::{future::Ready, prelude::*, ready, stream::SelectAll};
 use libp2p_core::{
     connection::Endpoint,
     transport::{ListenerId, TransportError, TransportEvent},
     Multiaddr, Transport,
 };
-use parity_send_wrapper::SendWrapper;
+use send_wrapper::SendWrapper;
 use std::{collections::VecDeque, error, fmt, io, mem, pin::Pin, task::Context, task::Poll};
 use wasm_bindgen::{prelude::*, JsCast};
 use wasm_bindgen_futures::JsFuture;
@@ -196,7 +198,11 @@ impl Transport for ExtTransport {
     type ListenerUpgrade = Ready<Result<Self::Output, Self::Error>>;
     type Dial = Dial;
 
-    fn listen_on(&mut self, addr: Multiaddr) -> Result<ListenerId, TransportError<Self::Error>> {
+    fn listen_on(
+        &mut self,
+        listener_id: ListenerId,
+        addr: Multiaddr,
+    ) -> Result<(), TransportError<Self::Error>> {
         let iter = self.inner.listen_on(&addr.to_string()).map_err(|err| {
             if is_not_supported_error(&err) {
                 TransportError::MultiaddrNotSupported(addr)
@@ -204,7 +210,6 @@ impl Transport for ExtTransport {
                 TransportError::Other(JsErr::from(err))
             }
         })?;
-        let listener_id = ListenerId::new();
         let listen = Listen {
             listener_id,
             iterator: SendWrapper::new(iter),
@@ -213,7 +218,7 @@ impl Transport for ExtTransport {
             is_closed: false,
         };
         self.listeners.push(listen);
-        Ok(listener_id)
+        Ok(())
     }
 
     fn remove_listener(&mut self, id: ListenerId) -> bool {
@@ -629,14 +634,14 @@ impl From<JsErr> for io::Error {
 
 impl fmt::Debug for JsErr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self)
+        write!(f, "{self}")
     }
 }
 
 impl fmt::Display for JsErr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if let Some(s) = self.0.as_string() {
-            write!(f, "{}", s)
+            write!(f, "{s}")
         } else if let Some(err) = self.0.dyn_ref::<js_sys::Error>() {
             write!(f, "{}", String::from(err.message()))
         } else if let Some(obj) = self.0.dyn_ref::<js_sys::Object>() {

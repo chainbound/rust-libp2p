@@ -18,13 +18,13 @@
 // FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 // DEALINGS IN THE SOFTWARE.
 
-use crate::message_proto::{hole_punch, HolePunch};
+use crate::proto;
 use asynchronous_codec::Framed;
 use futures::{future::BoxFuture, prelude::*};
 use futures_timer::Delay;
 use instant::Instant;
 use libp2p_core::{multiaddr::Protocol, upgrade, Multiaddr};
-use libp2p_swarm::NegotiatedSubstream;
+use libp2p_swarm::{Stream, StreamProtocol};
 use std::convert::TryFrom;
 use std::iter;
 use thiserror::Error;
@@ -34,7 +34,7 @@ pub struct Upgrade {
 }
 
 impl upgrade::UpgradeInfo for Upgrade {
-    type Info = &'static [u8];
+    type Info = StreamProtocol;
     type InfoIter = iter::Once<Self::Info>;
 
     fn protocol_info(&self) -> Self::InfoIter {
@@ -48,20 +48,20 @@ impl Upgrade {
     }
 }
 
-impl upgrade::OutboundUpgrade<NegotiatedSubstream> for Upgrade {
+impl upgrade::OutboundUpgrade<Stream> for Upgrade {
     type Output = Connect;
     type Error = UpgradeError;
     type Future = BoxFuture<'static, Result<Self::Output, Self::Error>>;
 
-    fn upgrade_outbound(self, substream: NegotiatedSubstream, _: Self::Info) -> Self::Future {
+    fn upgrade_outbound(self, substream: Stream, _: Self::Info) -> Self::Future {
         let mut substream = Framed::new(
             substream,
-            prost_codec::Codec::new(super::MAX_MESSAGE_SIZE_BYTES),
+            quick_protobuf_codec::Codec::new(super::MAX_MESSAGE_SIZE_BYTES),
         );
 
-        let msg = HolePunch {
-            r#type: hole_punch::Type::Connect.into(),
-            obs_addrs: self.obs_addrs.into_iter().map(|a| a.to_vec()).collect(),
+        let msg = proto::HolePunch {
+            type_pb: proto::Type::CONNECT,
+            ObsAddrs: self.obs_addrs.into_iter().map(|a| a.to_vec()).collect(),
         };
 
         async move {
@@ -69,35 +69,43 @@ impl upgrade::OutboundUpgrade<NegotiatedSubstream> for Upgrade {
 
             let sent_time = Instant::now();
 
-            let HolePunch { r#type, obs_addrs } =
+            let proto::HolePunch { type_pb, ObsAddrs } =
                 substream.next().await.ok_or(UpgradeError::StreamClosed)??;
 
             let rtt = sent_time.elapsed();
 
-            let r#type = hole_punch::Type::from_i32(r#type).ok_or(UpgradeError::ParseTypeField)?;
-            match r#type {
-                hole_punch::Type::Connect => {}
-                hole_punch::Type::Sync => return Err(UpgradeError::UnexpectedTypeSync),
+            match type_pb {
+                proto::Type::CONNECT => {}
+                proto::Type::SYNC => return Err(UpgradeError::UnexpectedTypeSync),
             }
 
-            let obs_addrs = if obs_addrs.is_empty() {
+            let obs_addrs = if ObsAddrs.is_empty() {
                 return Err(UpgradeError::NoAddresses);
             } else {
-                obs_addrs
+                ObsAddrs
                     .into_iter()
-                    .map(Multiaddr::try_from)
-                    // Filter out relayed addresses.
-                    .filter(|a| match a {
-                        Ok(a) => !a.iter().any(|p| p == Protocol::P2pCircuit),
-                        Err(_) => true,
+                    .filter_map(|a| match Multiaddr::try_from(a.to_vec()) {
+                        Ok(a) => Some(a),
+                        Err(e) => {
+                            log::debug!("Unable to parse multiaddr: {e}");
+                            None
+                        }
                     })
-                    .collect::<Result<Vec<Multiaddr>, _>>()
-                    .map_err(|_| UpgradeError::InvalidAddrs)?
+                    // Filter out relayed addresses.
+                    .filter(|a| {
+                        if a.iter().any(|p| p == Protocol::P2pCircuit) {
+                            log::debug!("Dropping relayed address {a}");
+                            false
+                        } else {
+                            true
+                        }
+                    })
+                    .collect::<Vec<Multiaddr>>()
             };
 
-            let msg = HolePunch {
-                r#type: hole_punch::Type::Sync.into(),
-                obs_addrs: vec![],
+            let msg = proto::HolePunch {
+                type_pb: proto::Type::SYNC,
+                ObsAddrs: vec![],
             };
 
             substream.send(msg).await?;
@@ -116,12 +124,8 @@ pub struct Connect {
 
 #[derive(Debug, Error)]
 pub enum UpgradeError {
-    #[error("Failed to encode or decode: {0}")]
-    Codec(
-        #[from]
-        #[source]
-        prost_codec::Error,
-    ),
+    #[error(transparent)]
+    Codec(#[from] quick_protobuf_codec::Error),
     #[error("Stream closed")]
     StreamClosed,
     #[error("Expected 'status' field to be set.")]
@@ -132,8 +136,6 @@ pub enum UpgradeError {
     NoAddresses,
     #[error("Invalid expiration timestamp in reservation.")]
     InvalidReservationExpiration,
-    #[error("Invalid addresses in reservation.")]
-    InvalidAddrs,
     #[error("Failed to parse response type field.")]
     ParseTypeField,
     #[error("Unexpected message type 'connect'")]

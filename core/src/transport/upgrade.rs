@@ -33,9 +33,10 @@ use crate::{
         self, apply_inbound, apply_outbound, InboundUpgrade, InboundUpgradeApply, OutboundUpgrade,
         OutboundUpgradeApply, UpgradeError,
     },
-    Negotiated, PeerId,
+    Negotiated,
 };
 use futures::{prelude::*, ready};
+use libp2p_identity::PeerId;
 use multiaddr::Multiaddr;
 use std::{
     error::Error,
@@ -349,8 +350,12 @@ where
         self.0.dial_as_listener(addr)
     }
 
-    fn listen_on(&mut self, addr: Multiaddr) -> Result<ListenerId, TransportError<Self::Error>> {
-        self.0.listen_on(addr)
+    fn listen_on(
+        &mut self,
+        id: ListenerId,
+        addr: Multiaddr,
+    ) -> Result<(), TransportError<Self::Error>> {
+        self.0.listen_on(id, addr)
     }
 
     fn address_translation(&self, server: &Multiaddr, observed: &Multiaddr) -> Option<Multiaddr> {
@@ -428,9 +433,13 @@ where
         })
     }
 
-    fn listen_on(&mut self, addr: Multiaddr) -> Result<ListenerId, TransportError<Self::Error>> {
+    fn listen_on(
+        &mut self,
+        id: ListenerId,
+        addr: Multiaddr,
+    ) -> Result<(), TransportError<Self::Error>> {
         self.inner
-            .listen_on(addr)
+            .listen_on(id, addr)
             .map_err(|err| err.map(TransportUpgradeError::Transport))
     }
 
@@ -471,8 +480,8 @@ where
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            TransportUpgradeError::Transport(e) => write!(f, "Transport error: {}", e),
-            TransportUpgradeError::Upgrade(e) => write!(f, "Upgrade error: {}", e),
+            TransportUpgradeError::Transport(e) => write!(f, "Transport error: {e}"),
+            TransportUpgradeError::Upgrade(e) => write!(f, "Upgrade error: {e}"),
         }
     }
 }

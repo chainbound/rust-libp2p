@@ -18,19 +18,21 @@
 // FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 // DEALINGS IN THE SOFTWARE.
 
-//! Implements the floodsub protocol, see also the:
-//! [spec](https://github.com/libp2p/specs/tree/master/pubsub).
+//! Implementation of the [floodsub](https://github.com/libp2p/specs/blob/master/pubsub/README.md) protocol.
 
-use libp2p_core::PeerId;
+#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
+
+use libp2p_identity::PeerId;
 
 pub mod protocol;
 
 mod layer;
 mod topic;
 
-#[allow(clippy::derive_partial_eq_without_eq)]
-mod rpc_proto {
-    include!(concat!(env!("OUT_DIR"), "/floodsub.pb.rs"));
+mod proto {
+    #![allow(unreachable_pub)]
+    include!("generated/mod.rs");
+    pub(crate) use self::floodsub::pb::{mod_RPC::SubOpts, Message, RPC};
 }
 
 pub use self::layer::{Floodsub, FloodsubEvent};

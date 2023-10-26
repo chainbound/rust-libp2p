@@ -18,122 +18,141 @@
 // FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 // DEALINGS IN THE SOFTWARE.
 
-use prometheus_client::encoding::text::Encode;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
+use crate::protocol_stack;
+use instant::Instant;
+use libp2p_swarm::ConnectionId;
+use prometheus_client::encoding::{EncodeLabelSet, EncodeLabelValue};
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
-use prometheus_client::registry::Registry;
+use prometheus_client::metrics::histogram::{exponential_buckets, Histogram};
+use prometheus_client::registry::{Registry, Unit};
 
-pub struct Metrics {
-    connections_incoming: Counter,
+pub(crate) struct Metrics {
+    connections_incoming: Family<AddressLabels, Counter>,
     connections_incoming_error: Family<IncomingConnectionErrorLabels, Counter>,
 
-    connections_established: Family<ConnectionEstablishedLabels, Counter>,
-    connections_closed: Family<ConnectionClosedLabels, Counter>,
+    connections_established: Family<ConnectionLabels, Counter>,
+    connections_establishment_duration: Family<ConnectionLabels, Histogram>,
+    connections_duration: Family<ConnectionClosedLabels, Histogram>,
 
-    new_listen_addr: Counter,
-    expired_listen_addr: Counter,
+    new_listen_addr: Family<AddressLabels, Counter>,
+    expired_listen_addr: Family<AddressLabels, Counter>,
 
-    listener_closed: Counter,
+    listener_closed: Family<AddressLabels, Counter>,
     listener_error: Counter,
 
     dial_attempt: Counter,
     outgoing_connection_error: Family<OutgoingConnectionErrorLabels, Counter>,
-    connected_to_banned_peer: Counter,
+
+    connections: Arc<Mutex<HashMap<ConnectionId, Instant>>>,
 }
 
 impl Metrics {
-    pub fn new(registry: &mut Registry) -> Self {
+    pub(crate) fn new(registry: &mut Registry) -> Self {
         let sub_registry = registry.sub_registry_with_prefix("swarm");
 
-        let connections_incoming = Counter::default();
+        let connections_incoming = Family::default();
         sub_registry.register(
             "connections_incoming",
-            "Number of incoming connections",
-            Box::new(connections_incoming.clone()),
+            "Number of incoming connections per address stack",
+            connections_incoming.clone(),
         );
 
         let connections_incoming_error = Family::default();
         sub_registry.register(
             "connections_incoming_error",
             "Number of incoming connection errors",
-            Box::new(connections_incoming_error.clone()),
+            connections_incoming_error.clone(),
         );
 
-        let new_listen_addr = Counter::default();
+        let new_listen_addr = Family::default();
         sub_registry.register(
             "new_listen_addr",
             "Number of new listen addresses",
-            Box::new(new_listen_addr.clone()),
+            new_listen_addr.clone(),
         );
 
-        let expired_listen_addr = Counter::default();
+        let expired_listen_addr = Family::default();
         sub_registry.register(
             "expired_listen_addr",
             "Number of expired listen addresses",
-            Box::new(expired_listen_addr.clone()),
+            expired_listen_addr.clone(),
         );
 
-        let listener_closed = Counter::default();
+        let listener_closed = Family::default();
         sub_registry.register(
             "listener_closed",
             "Number of listeners closed",
-            Box::new(listener_closed.clone()),
+            listener_closed.clone(),
         );
 
         let listener_error = Counter::default();
         sub_registry.register(
             "listener_error",
             "Number of listener errors",
-            Box::new(listener_error.clone()),
+            listener_error.clone(),
         );
 
         let dial_attempt = Counter::default();
         sub_registry.register(
             "dial_attempt",
             "Number of dial attempts",
-            Box::new(dial_attempt.clone()),
+            dial_attempt.clone(),
         );
 
         let outgoing_connection_error = Family::default();
         sub_registry.register(
             "outgoing_connection_error",
             "Number outgoing connection errors",
-            Box::new(outgoing_connection_error.clone()),
-        );
-
-        let connected_to_banned_peer = Counter::default();
-        sub_registry.register(
-            "connected_to_banned_peer",
-            "Number of connection attempts to banned peer",
-            Box::new(connected_to_banned_peer.clone()),
+            outgoing_connection_error.clone(),
         );
 
         let connections_established = Family::default();
         sub_registry.register(
             "connections_established",
             "Number of connections established",
-            Box::new(connections_established.clone()),
+            connections_established.clone(),
         );
 
-        let connections_closed = Family::default();
+        let connections_establishment_duration = {
+            let constructor: fn() -> Histogram =
+                || Histogram::new(exponential_buckets(0.01, 1.5, 20));
+            Family::new_with_constructor(constructor)
+        };
         sub_registry.register(
-            "connections_closed",
-            "Number of connections closed",
-            Box::new(connections_closed.clone()),
+            "connections_establishment_duration",
+            "Time it took (locally) to establish connections",
+            connections_establishment_duration.clone(),
+        );
+
+        let connections_duration = {
+            let constructor: fn() -> Histogram =
+                || Histogram::new(exponential_buckets(0.01, 3.0, 20));
+            Family::new_with_constructor(constructor)
+        };
+        sub_registry.register_with_unit(
+            "connections_duration",
+            "Time a connection was alive",
+            Unit::Seconds,
+            connections_duration.clone(),
         );
 
         Self {
             connections_incoming,
             connections_incoming_error,
             connections_established,
-            connections_closed,
             new_listen_addr,
             expired_listen_addr,
             listener_closed,
             listener_error,
             dial_attempt,
             outgoing_connection_error,
-            connected_to_banned_peer,
+            connections_establishment_duration,
+            connections_duration,
+            connections: Default::default(),
         }
     }
 }
@@ -142,31 +161,68 @@ impl<TBvEv, THandleErr> super::Recorder<libp2p_swarm::SwarmEvent<TBvEv, THandleE
     fn record(&self, event: &libp2p_swarm::SwarmEvent<TBvEv, THandleErr>) {
         match event {
             libp2p_swarm::SwarmEvent::Behaviour(_) => {}
-            libp2p_swarm::SwarmEvent::ConnectionEstablished { endpoint, .. } => {
-                self.connections_established
-                    .get_or_create(&ConnectionEstablishedLabels {
+            libp2p_swarm::SwarmEvent::ConnectionEstablished {
+                endpoint,
+                established_in: time_taken,
+                connection_id,
+                ..
+            } => {
+                let labels = ConnectionLabels {
+                    role: endpoint.into(),
+                    protocols: protocol_stack::as_string(endpoint.get_remote_address()),
+                };
+                self.connections_established.get_or_create(&labels).inc();
+                self.connections_establishment_duration
+                    .get_or_create(&labels)
+                    .observe(time_taken.as_secs_f64());
+                self.connections
+                    .lock()
+                    .expect("lock not to be poisoned")
+                    .insert(*connection_id, Instant::now());
+            }
+            libp2p_swarm::SwarmEvent::ConnectionClosed {
+                endpoint,
+                connection_id,
+                cause,
+                ..
+            } => {
+                let labels = ConnectionClosedLabels {
+                    connection: ConnectionLabels {
                         role: endpoint.into(),
+                        protocols: protocol_stack::as_string(endpoint.get_remote_address()),
+                    },
+                    cause: cause.as_ref().map(Into::into),
+                };
+                self.connections_duration.get_or_create(&labels).observe(
+                    self.connections
+                        .lock()
+                        .expect("lock not to be poisoned")
+                        .remove(connection_id)
+                        .expect("closed connection to previously be established")
+                        .elapsed()
+                        .as_secs_f64(),
+                );
+            }
+            libp2p_swarm::SwarmEvent::IncomingConnection { send_back_addr, .. } => {
+                self.connections_incoming
+                    .get_or_create(&AddressLabels {
+                        protocols: protocol_stack::as_string(send_back_addr),
                     })
                     .inc();
             }
-            libp2p_swarm::SwarmEvent::ConnectionClosed { endpoint, .. } => {
-                self.connections_closed
-                    .get_or_create(&ConnectionClosedLabels {
-                        role: endpoint.into(),
-                    })
-                    .inc();
-            }
-            libp2p_swarm::SwarmEvent::IncomingConnection { .. } => {
-                self.connections_incoming.inc();
-            }
-            libp2p_swarm::SwarmEvent::IncomingConnectionError { error, .. } => {
+            libp2p_swarm::SwarmEvent::IncomingConnectionError {
+                error,
+                send_back_addr,
+                ..
+            } => {
                 self.connections_incoming_error
                     .get_or_create(&IncomingConnectionErrorLabels {
                         error: error.into(),
+                        protocols: protocol_stack::as_string(send_back_addr),
                     })
                     .inc();
             }
-            libp2p_swarm::SwarmEvent::OutgoingConnectionError { error, peer_id } => {
+            libp2p_swarm::SwarmEvent::OutgoingConnectionError { error, peer_id, .. } => {
                 let peer = match peer_id {
                     Some(_) => PeerStatus::Known,
                     None => PeerStatus::Unknown,
@@ -184,76 +240,102 @@ impl<TBvEv, THandleErr> super::Recorder<libp2p_swarm::SwarmEvent<TBvEv, THandleE
                             match error {
                                 libp2p_core::transport::TransportError::MultiaddrNotSupported(
                                     _,
-                                ) => record(
-                                    OutgoingConnectionErrorError::TransportMultiaddrNotSupported,
-                                ),
+                                ) => {
+                                    record(OutgoingConnectionError::TransportMultiaddrNotSupported)
+                                }
                                 libp2p_core::transport::TransportError::Other(_) => {
-                                    record(OutgoingConnectionErrorError::TransportOther)
+                                    record(OutgoingConnectionError::TransportOther)
                                 }
                             };
                         }
                     }
-
-                    libp2p_swarm::DialError::Banned => record(OutgoingConnectionErrorError::Banned),
-                    libp2p_swarm::DialError::ConnectionLimit(_) => {
-                        record(OutgoingConnectionErrorError::ConnectionLimit)
-                    }
-                    libp2p_swarm::DialError::LocalPeerId => {
-                        record(OutgoingConnectionErrorError::LocalPeerId)
+                    libp2p_swarm::DialError::LocalPeerId { .. } => {
+                        record(OutgoingConnectionError::LocalPeerId)
                     }
                     libp2p_swarm::DialError::NoAddresses => {
-                        record(OutgoingConnectionErrorError::NoAddresses)
+                        record(OutgoingConnectionError::NoAddresses)
                     }
                     libp2p_swarm::DialError::DialPeerConditionFalse(_) => {
-                        record(OutgoingConnectionErrorError::DialPeerConditionFalse)
+                        record(OutgoingConnectionError::DialPeerConditionFalse)
                     }
-                    libp2p_swarm::DialError::Aborted => {
-                        record(OutgoingConnectionErrorError::Aborted)
-                    }
-                    libp2p_swarm::DialError::InvalidPeerId { .. } => {
-                        record(OutgoingConnectionErrorError::InvalidPeerId)
-                    }
+                    libp2p_swarm::DialError::Aborted => record(OutgoingConnectionError::Aborted),
                     libp2p_swarm::DialError::WrongPeerId { .. } => {
-                        record(OutgoingConnectionErrorError::WrongPeerId)
+                        record(OutgoingConnectionError::WrongPeerId)
                     }
-                    libp2p_swarm::DialError::ConnectionIo(_) => {
-                        record(OutgoingConnectionErrorError::ConnectionIo)
+                    libp2p_swarm::DialError::Denied { .. } => {
+                        record(OutgoingConnectionError::Denied)
                     }
                 };
             }
-            libp2p_swarm::SwarmEvent::BannedPeer { .. } => {
-                self.connected_to_banned_peer.inc();
+            libp2p_swarm::SwarmEvent::NewListenAddr { address, .. } => {
+                self.new_listen_addr
+                    .get_or_create(&AddressLabels {
+                        protocols: protocol_stack::as_string(address),
+                    })
+                    .inc();
             }
-            libp2p_swarm::SwarmEvent::NewListenAddr { .. } => {
-                self.new_listen_addr.inc();
+            libp2p_swarm::SwarmEvent::ExpiredListenAddr { address, .. } => {
+                self.expired_listen_addr
+                    .get_or_create(&AddressLabels {
+                        protocols: protocol_stack::as_string(address),
+                    })
+                    .inc();
             }
-            libp2p_swarm::SwarmEvent::ExpiredListenAddr { .. } => {
-                self.expired_listen_addr.inc();
-            }
-            libp2p_swarm::SwarmEvent::ListenerClosed { .. } => {
-                self.listener_closed.inc();
+            libp2p_swarm::SwarmEvent::ListenerClosed { addresses, .. } => {
+                for address in addresses {
+                    self.listener_closed
+                        .get_or_create(&AddressLabels {
+                            protocols: protocol_stack::as_string(address),
+                        })
+                        .inc();
+                }
             }
             libp2p_swarm::SwarmEvent::ListenerError { .. } => {
                 self.listener_error.inc();
             }
-            libp2p_swarm::SwarmEvent::Dialing(_) => {
+            libp2p_swarm::SwarmEvent::Dialing { .. } => {
                 self.dial_attempt.inc();
             }
         }
     }
 }
 
-#[derive(Encode, Hash, Clone, Eq, PartialEq)]
-struct ConnectionEstablishedLabels {
+#[derive(EncodeLabelSet, Hash, Clone, Eq, PartialEq, Debug)]
+struct ConnectionLabels {
     role: Role,
+    protocols: String,
 }
 
-#[derive(Encode, Hash, Clone, Eq, PartialEq)]
+#[derive(EncodeLabelSet, Hash, Clone, Eq, PartialEq, Debug)]
 struct ConnectionClosedLabels {
-    role: Role,
+    cause: Option<ConnectionError>,
+    #[prometheus(flatten)]
+    connection: ConnectionLabels,
 }
 
-#[derive(Encode, Hash, Clone, Eq, PartialEq)]
+#[derive(EncodeLabelValue, Hash, Clone, Eq, PartialEq, Debug)]
+enum ConnectionError {
+    Io,
+    KeepAliveTimeout,
+    Handler,
+}
+
+impl<E> From<&libp2p_swarm::ConnectionError<E>> for ConnectionError {
+    fn from(value: &libp2p_swarm::ConnectionError<E>) -> Self {
+        match value {
+            libp2p_swarm::ConnectionError::IO(_) => ConnectionError::Io,
+            libp2p_swarm::ConnectionError::KeepAliveTimeout => ConnectionError::KeepAliveTimeout,
+            libp2p_swarm::ConnectionError::Handler(_) => ConnectionError::Handler,
+        }
+    }
+}
+
+#[derive(EncodeLabelSet, Hash, Clone, Eq, PartialEq, Debug)]
+struct AddressLabels {
+    protocols: String,
+}
+
+#[derive(EncodeLabelValue, Hash, Clone, Eq, PartialEq, Debug)]
 enum Role {
     Dialer,
     Listener,
@@ -268,69 +350,59 @@ impl From<&libp2p_core::ConnectedPoint> for Role {
     }
 }
 
-#[derive(Encode, Hash, Clone, Eq, PartialEq)]
+#[derive(EncodeLabelSet, Hash, Clone, Eq, PartialEq, Debug)]
 struct OutgoingConnectionErrorLabels {
     peer: PeerStatus,
-    error: OutgoingConnectionErrorError,
+    error: OutgoingConnectionError,
 }
 
-#[derive(Encode, Hash, Clone, Eq, PartialEq, Copy)]
+#[derive(EncodeLabelValue, Hash, Clone, Eq, PartialEq, Copy, Debug)]
 enum PeerStatus {
     Known,
     Unknown,
 }
 
-#[derive(Encode, Hash, Clone, Eq, PartialEq)]
-enum OutgoingConnectionErrorError {
-    Banned,
-    ConnectionLimit,
+#[derive(EncodeLabelValue, Hash, Clone, Eq, PartialEq, Debug)]
+enum OutgoingConnectionError {
     LocalPeerId,
     NoAddresses,
     DialPeerConditionFalse,
     Aborted,
-    InvalidPeerId,
     WrongPeerId,
-    ConnectionIo,
     TransportMultiaddrNotSupported,
     TransportOther,
+    Denied,
 }
 
-#[derive(Encode, Hash, Clone, Eq, PartialEq)]
+#[derive(EncodeLabelSet, Hash, Clone, Eq, PartialEq, Debug)]
 struct IncomingConnectionErrorLabels {
-    error: PendingInboundConnectionError,
+    error: IncomingConnectionError,
+    protocols: String,
 }
 
-#[derive(Encode, Hash, Clone, Eq, PartialEq)]
-enum PendingInboundConnectionError {
+#[derive(EncodeLabelValue, Hash, Clone, Eq, PartialEq, Debug)]
+enum IncomingConnectionError {
     WrongPeerId,
+    LocalPeerId,
     TransportErrorMultiaddrNotSupported,
     TransportErrorOther,
     Aborted,
-    Io,
-    ConnectionLimit,
+    Denied,
 }
 
-impl<TTransErr> From<&libp2p_swarm::PendingInboundConnectionError<TTransErr>>
-    for PendingInboundConnectionError
-{
-    fn from(error: &libp2p_swarm::PendingInboundConnectionError<TTransErr>) -> Self {
+impl From<&libp2p_swarm::ListenError> for IncomingConnectionError {
+    fn from(error: &libp2p_swarm::ListenError) -> Self {
         match error {
-            libp2p_swarm::PendingInboundConnectionError::WrongPeerId { .. } => {
-                PendingInboundConnectionError::WrongPeerId
-            }
-            libp2p_swarm::PendingInboundConnectionError::ConnectionLimit(_) => {
-                PendingInboundConnectionError::ConnectionLimit
-            }
-            libp2p_swarm::PendingInboundConnectionError::Transport(
+            libp2p_swarm::ListenError::WrongPeerId { .. } => IncomingConnectionError::WrongPeerId,
+            libp2p_swarm::ListenError::LocalPeerId { .. } => IncomingConnectionError::LocalPeerId,
+            libp2p_swarm::ListenError::Transport(
                 libp2p_core::transport::TransportError::MultiaddrNotSupported(_),
-            ) => PendingInboundConnectionError::TransportErrorMultiaddrNotSupported,
-            libp2p_swarm::PendingInboundConnectionError::Transport(
+            ) => IncomingConnectionError::TransportErrorMultiaddrNotSupported,
+            libp2p_swarm::ListenError::Transport(
                 libp2p_core::transport::TransportError::Other(_),
-            ) => PendingInboundConnectionError::TransportErrorOther,
-            libp2p_swarm::PendingInboundConnectionError::Aborted => {
-                PendingInboundConnectionError::Aborted
-            }
-            libp2p_swarm::PendingInboundConnectionError::IO(_) => PendingInboundConnectionError::Io,
+            ) => IncomingConnectionError::TransportErrorOther,
+            libp2p_swarm::ListenError::Aborted => IncomingConnectionError::Aborted,
+            libp2p_swarm::ListenError::Denied { .. } => IncomingConnectionError::Denied,
         }
     }
 }

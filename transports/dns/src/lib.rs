@@ -18,7 +18,8 @@
 // FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 // DEALINGS IN THE SOFTWARE.
 
-//! # libp2p-dns
+//! # [DNS name resolution](https://github.com/libp2p/specs/blob/master/addressing/README.md#ip-and-name-resolution)
+//! [`Transport`] for libp2p.
 //!
 //! This crate provides the type [`GenDnsConfig`] with its instantiations
 //! [`DnsConfig`] and `TokioDnsConfig` for use with `async-std` and `tokio`,
@@ -53,6 +54,8 @@
 //! and provide a custom [`ResolverConfig`].
 //!
 //![trust-dns-resolver]: https://docs.rs/trust-dns-resolver/latest/trust_dns_resolver/#dns-over-tls-and-dns-over-https
+
+#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
 
 #[cfg(feature = "async-std")]
 use async_std_resolver::{AsyncStdConnection, AsyncStdConnectionProvider};
@@ -195,10 +198,14 @@ where
         BoxFuture<'static, Result<Self::Output, Self::Error>>,
     >;
 
-    fn listen_on(&mut self, addr: Multiaddr) -> Result<ListenerId, TransportError<Self::Error>> {
+    fn listen_on(
+        &mut self,
+        id: ListenerId,
+        addr: Multiaddr,
+    ) -> Result<(), TransportError<Self::Error>> {
         self.inner
             .lock()
-            .listen_on(addr)
+            .listen_on(id, addr)
             .map_err(|e| e.map(DnsErr::Transport))
     }
 
@@ -407,9 +414,9 @@ where
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            DnsErr::Transport(err) => write!(f, "{}", err),
-            DnsErr::ResolveError(err) => write!(f, "{}", err),
-            DnsErr::MultiaddrNotSupported(a) => write!(f, "Unsupported resolved address: {}", a),
+            DnsErr::Transport(err) => write!(f, "{err}"),
+            DnsErr::ResolveError(err) => write!(f, "{err}"),
+            DnsErr::MultiaddrNotSupported(a) => write!(f, "Unsupported resolved address: {a}"),
             DnsErr::TooManyLookups => write!(f, "Too many DNS lookups"),
         }
     }
@@ -570,15 +577,16 @@ fn invalid_data(e: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> io::E
     io::Error::new(io::ErrorKind::InvalidData, e)
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "tokio", feature = "async-std")))]
 mod tests {
     use super::*;
     use futures::future::BoxFuture;
     use libp2p_core::{
         multiaddr::{Multiaddr, Protocol},
         transport::{TransportError, TransportEvent},
-        PeerId, Transport,
+        Transport,
     };
+    use libp2p_identity::PeerId;
 
     #[test]
     fn basic_resolve() {
@@ -595,8 +603,9 @@ mod tests {
 
             fn listen_on(
                 &mut self,
+                _: ListenerId,
                 _: Multiaddr,
-            ) -> Result<ListenerId, TransportError<Self::Error>> {
+            ) -> Result<(), TransportError<Self::Error>> {
                 unreachable!()
             }
 
@@ -689,7 +698,7 @@ mod tests {
                 .await
             {
                 Err(DnsErr::ResolveError(_)) => {}
-                Err(e) => panic!("Unexpected error: {:?}", e),
+                Err(e) => panic!("Unexpected error: {e:?}"),
                 Ok(_) => panic!("Unexpected success."),
             }
 
@@ -701,9 +710,9 @@ mod tests {
             {
                 Err(DnsErr::ResolveError(e)) => match e.kind() {
                     ResolveErrorKind::NoRecordsFound { .. } => {}
-                    _ => panic!("Unexpected DNS error: {:?}", e),
+                    _ => panic!("Unexpected DNS error: {e:?}"),
                 },
-                Err(e) => panic!("Unexpected error: {:?}", e),
+                Err(e) => panic!("Unexpected error: {e:?}"),
                 Ok(_) => panic!("Unexpected success."),
             }
         }

@@ -26,13 +26,13 @@ use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughpu
 use futures::future::poll_fn;
 use futures::prelude::*;
 use futures::{channel::oneshot, future::join};
-use libp2p::core::muxing::StreamMuxerExt;
-use libp2p::core::{
-    identity, multiaddr::multiaddr, muxing, transport, upgrade, Multiaddr, PeerId, Transport,
-};
-use libp2p::mplex;
-use libp2p::plaintext::PlainText2Config;
-use libp2p::tcp::GenTcpConfig;
+use libp2p_core::muxing::StreamMuxerExt;
+use libp2p_core::transport::ListenerId;
+use libp2p_core::{multiaddr::multiaddr, muxing, transport, upgrade, Multiaddr, Transport};
+use libp2p_identity as identity;
+use libp2p_identity::PeerId;
+use libp2p_mplex as mplex;
+use libp2p_plaintext::PlainText2Config;
 use std::pin::Pin;
 use std::time::Duration;
 
@@ -61,7 +61,7 @@ fn prepare(c: &mut Criterion) {
         tcp.throughput(Throughput::Bytes(payload.len() as u64));
         let mut receiver_transport = tcp_transport(size);
         let mut sender_transport = tcp_transport(size);
-        tcp.bench_function(format!("{}", size), |b| {
+        tcp.bench_function(format!("{size}"), |b| {
             b.iter(|| {
                 run(
                     black_box(&mut receiver_transport),
@@ -80,7 +80,7 @@ fn prepare(c: &mut Criterion) {
         mem.throughput(Throughput::Bytes(payload.len() as u64));
         let mut receiver_transport = mem_transport(size);
         let mut sender_transport = mem_transport(size);
-        mem.bench_function(format!("{}", size), |b| {
+        mem.bench_function(format!("{size}"), |b| {
             b.iter(|| {
                 run(
                     black_box(&mut receiver_transport),
@@ -101,7 +101,9 @@ fn run(
     payload: &Vec<u8>,
     listen_addr: &Multiaddr,
 ) {
-    receiver_trans.listen_on(listen_addr.clone()).unwrap();
+    receiver_trans
+        .listen_on(ListenerId::next(), listen_addr.clone())
+        .unwrap();
     let (addr_sender, addr_receiver) = oneshot::channel();
     let mut addr_sender = Some(addr_sender);
     let payload_len = payload.len();
@@ -170,7 +172,7 @@ fn tcp_transport(split_send_size: usize) -> BenchTransport {
     let mut mplex = mplex::MplexConfig::default();
     mplex.set_split_send_size(split_send_size);
 
-    libp2p::tcp::TcpTransport::new(GenTcpConfig::default().nodelay(true))
+    libp2p_tcp::async_io::Transport::new(libp2p_tcp::Config::default().nodelay(true))
         .upgrade(upgrade::Version::V1)
         .authenticate(PlainText2Config { local_public_key })
         .multiplex(mplex)

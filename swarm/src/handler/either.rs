@@ -19,47 +19,54 @@
 // DEALINGS IN THE SOFTWARE.
 
 use crate::handler::{
-    ConnectionHandler, ConnectionHandlerEvent, ConnectionHandlerUpgrErr, IntoConnectionHandler,
-    KeepAlive, SubstreamProtocol,
+    ConnectionEvent, ConnectionHandler, ConnectionHandlerEvent, FullyNegotiatedInbound,
+    InboundUpgradeSend, KeepAlive, ListenUpgradeError, SubstreamProtocol,
 };
-use crate::upgrade::{InboundUpgradeSend, OutboundUpgradeSend, SendWrapper};
+use crate::upgrade::SendWrapper;
 use either::Either;
-use libp2p_core::either::{EitherError, EitherOutput};
-use libp2p_core::upgrade::{EitherUpgrade, UpgradeError};
-use libp2p_core::{ConnectedPoint, Multiaddr, PeerId};
+use futures::future;
 use std::task::{Context, Poll};
 
-pub enum IntoEitherHandler<L, R> {
-    Left(L),
-    Right(R),
-}
-
-/// Implementation of a [`IntoConnectionHandler`] that represents either of two [`IntoConnectionHandler`]
-/// implementations.
-impl<L, R> IntoConnectionHandler for IntoEitherHandler<L, R>
+impl<LIP, RIP, LIOI, RIOI>
+    FullyNegotiatedInbound<Either<SendWrapper<LIP>, SendWrapper<RIP>>, Either<LIOI, RIOI>>
 where
-    L: IntoConnectionHandler,
-    R: IntoConnectionHandler,
+    RIP: InboundUpgradeSend,
+    LIP: InboundUpgradeSend,
 {
-    type Handler = Either<L::Handler, R::Handler>;
-
-    fn into_handler(self, p: &PeerId, c: &ConnectedPoint) -> Self::Handler {
+    pub(crate) fn transpose(
+        self,
+    ) -> Either<FullyNegotiatedInbound<LIP, LIOI>, FullyNegotiatedInbound<RIP, RIOI>> {
         match self {
-            IntoEitherHandler::Left(into_handler) => Either::Left(into_handler.into_handler(p, c)),
-            IntoEitherHandler::Right(into_handler) => {
-                Either::Right(into_handler.into_handler(p, c))
-            }
+            FullyNegotiatedInbound {
+                protocol: future::Either::Left(protocol),
+                info: Either::Left(info),
+            } => Either::Left(FullyNegotiatedInbound { protocol, info }),
+            FullyNegotiatedInbound {
+                protocol: future::Either::Right(protocol),
+                info: Either::Right(info),
+            } => Either::Right(FullyNegotiatedInbound { protocol, info }),
+            _ => unreachable!(),
         }
     }
+}
 
-    fn inbound_protocol(&self) -> <Self::Handler as ConnectionHandler>::InboundProtocol {
+impl<LIP, RIP, LIOI, RIOI>
+    ListenUpgradeError<Either<LIOI, RIOI>, Either<SendWrapper<LIP>, SendWrapper<RIP>>>
+where
+    RIP: InboundUpgradeSend,
+    LIP: InboundUpgradeSend,
+{
+    fn transpose(self) -> Either<ListenUpgradeError<LIOI, LIP>, ListenUpgradeError<RIOI, RIP>> {
         match self {
-            IntoEitherHandler::Left(into_handler) => {
-                EitherUpgrade::A(SendWrapper(into_handler.inbound_protocol()))
-            }
-            IntoEitherHandler::Right(into_handler) => {
-                EitherUpgrade::B(SendWrapper(into_handler.inbound_protocol()))
-            }
+            ListenUpgradeError {
+                error: Either::Left(error),
+                info: Either::Left(info),
+            } => Either::Left(ListenUpgradeError { error, info }),
+            ListenUpgradeError {
+                error: Either::Right(error),
+                info: Either::Right(info),
+            } => Either::Right(ListenUpgradeError { error, info }),
+            _ => unreachable!(),
         }
     }
 }
@@ -71,13 +78,12 @@ where
     L: ConnectionHandler,
     R: ConnectionHandler,
 {
-    type InEvent = Either<L::InEvent, R::InEvent>;
-    type OutEvent = Either<L::OutEvent, R::OutEvent>;
+    type FromBehaviour = Either<L::FromBehaviour, R::FromBehaviour>;
+    type ToBehaviour = Either<L::ToBehaviour, R::ToBehaviour>;
     type Error = Either<L::Error, R::Error>;
-    type InboundProtocol =
-        EitherUpgrade<SendWrapper<L::InboundProtocol>, SendWrapper<R::InboundProtocol>>;
+    type InboundProtocol = Either<SendWrapper<L::InboundProtocol>, SendWrapper<R::InboundProtocol>>;
     type OutboundProtocol =
-        EitherUpgrade<SendWrapper<L::OutboundProtocol>, SendWrapper<R::OutboundProtocol>>;
+        Either<SendWrapper<L::OutboundProtocol>, SendWrapper<R::OutboundProtocol>>;
     type InboundOpenInfo = Either<L::InboundOpenInfo, R::InboundOpenInfo>;
     type OutboundOpenInfo = Either<L::OutboundOpenInfo, R::OutboundOpenInfo>;
 
@@ -85,187 +91,20 @@ where
         match self {
             Either::Left(a) => a
                 .listen_protocol()
-                .map_upgrade(|u| EitherUpgrade::A(SendWrapper(u)))
+                .map_upgrade(|u| Either::Left(SendWrapper(u)))
                 .map_info(Either::Left),
             Either::Right(b) => b
                 .listen_protocol()
-                .map_upgrade(|u| EitherUpgrade::B(SendWrapper(u)))
+                .map_upgrade(|u| Either::Right(SendWrapper(u)))
                 .map_info(Either::Right),
         }
     }
 
-    fn inject_fully_negotiated_outbound(
-        &mut self,
-        output: <Self::OutboundProtocol as OutboundUpgradeSend>::Output,
-        info: Self::OutboundOpenInfo,
-    ) {
-        match (self, output, info) {
-            (Either::Left(handler), EitherOutput::First(output), Either::Left(info)) => {
-                handler.inject_fully_negotiated_outbound(output, info)
-            }
-            (Either::Right(handler), EitherOutput::Second(output), Either::Right(info)) => {
-                handler.inject_fully_negotiated_outbound(output, info)
-            }
-            _ => unreachable!(),
-        }
-    }
-
-    fn inject_fully_negotiated_inbound(
-        &mut self,
-        output: <Self::InboundProtocol as InboundUpgradeSend>::Output,
-        info: Self::InboundOpenInfo,
-    ) {
-        match (self, output, info) {
-            (Either::Left(handler), EitherOutput::First(output), Either::Left(info)) => {
-                handler.inject_fully_negotiated_inbound(output, info)
-            }
-            (Either::Right(handler), EitherOutput::Second(output), Either::Right(info)) => {
-                handler.inject_fully_negotiated_inbound(output, info)
-            }
-            _ => unreachable!(),
-        }
-    }
-
-    fn inject_event(&mut self, event: Self::InEvent) {
+    fn on_behaviour_event(&mut self, event: Self::FromBehaviour) {
         match (self, event) {
-            (Either::Left(handler), Either::Left(event)) => handler.inject_event(event),
-            (Either::Right(handler), Either::Right(event)) => handler.inject_event(event),
+            (Either::Left(handler), Either::Left(event)) => handler.on_behaviour_event(event),
+            (Either::Right(handler), Either::Right(event)) => handler.on_behaviour_event(event),
             _ => unreachable!(),
-        }
-    }
-
-    fn inject_address_change(&mut self, addr: &Multiaddr) {
-        match self {
-            Either::Left(handler) => handler.inject_address_change(addr),
-            Either::Right(handler) => handler.inject_address_change(addr),
-        }
-    }
-
-    fn inject_dial_upgrade_error(
-        &mut self,
-        info: Self::OutboundOpenInfo,
-        error: ConnectionHandlerUpgrErr<<Self::OutboundProtocol as OutboundUpgradeSend>::Error>,
-    ) {
-        match error {
-            ConnectionHandlerUpgrErr::Timer => match (self, info) {
-                (Either::Left(handler), Either::Left(info)) => {
-                    handler.inject_dial_upgrade_error(info, ConnectionHandlerUpgrErr::Timer);
-                }
-                (Either::Right(handler), Either::Right(info)) => {
-                    handler.inject_dial_upgrade_error(info, ConnectionHandlerUpgrErr::Timer);
-                }
-                _ => unreachable!(),
-            },
-            ConnectionHandlerUpgrErr::Timeout => match (self, info) {
-                (Either::Left(handler), Either::Left(info)) => {
-                    handler.inject_dial_upgrade_error(info, ConnectionHandlerUpgrErr::Timeout);
-                }
-                (Either::Right(handler), Either::Right(info)) => {
-                    handler.inject_dial_upgrade_error(info, ConnectionHandlerUpgrErr::Timeout);
-                }
-                _ => unreachable!(),
-            },
-            ConnectionHandlerUpgrErr::Upgrade(UpgradeError::Select(error)) => match (self, info) {
-                (Either::Left(handler), Either::Left(info)) => {
-                    handler.inject_dial_upgrade_error(
-                        info,
-                        ConnectionHandlerUpgrErr::Upgrade(UpgradeError::Select(error)),
-                    );
-                }
-                (Either::Right(handler), Either::Right(info)) => {
-                    handler.inject_dial_upgrade_error(
-                        info,
-                        ConnectionHandlerUpgrErr::Upgrade(UpgradeError::Select(error)),
-                    );
-                }
-                _ => unreachable!(),
-            },
-            ConnectionHandlerUpgrErr::Upgrade(UpgradeError::Apply(EitherError::A(e))) => {
-                match (self, info) {
-                    (Either::Left(handler), Either::Left(info)) => {
-                        handler.inject_dial_upgrade_error(
-                            info,
-                            ConnectionHandlerUpgrErr::Upgrade(UpgradeError::Apply(e)),
-                        );
-                    }
-                    _ => unreachable!(),
-                }
-            }
-            ConnectionHandlerUpgrErr::Upgrade(UpgradeError::Apply(EitherError::B(e))) => {
-                match (self, info) {
-                    (Either::Right(handler), Either::Right(info)) => {
-                        handler.inject_dial_upgrade_error(
-                            info,
-                            ConnectionHandlerUpgrErr::Upgrade(UpgradeError::Apply(e)),
-                        );
-                    }
-                    _ => unreachable!(),
-                }
-            }
-        }
-    }
-
-    fn inject_listen_upgrade_error(
-        &mut self,
-        info: Self::InboundOpenInfo,
-        error: ConnectionHandlerUpgrErr<<Self::InboundProtocol as InboundUpgradeSend>::Error>,
-    ) {
-        match error {
-            ConnectionHandlerUpgrErr::Timer => match (self, info) {
-                (Either::Left(handler), Either::Left(info)) => {
-                    handler.inject_listen_upgrade_error(info, ConnectionHandlerUpgrErr::Timer);
-                }
-                (Either::Right(handler), Either::Right(info)) => {
-                    handler.inject_listen_upgrade_error(info, ConnectionHandlerUpgrErr::Timer);
-                }
-                _ => unreachable!(),
-            },
-            ConnectionHandlerUpgrErr::Timeout => match (self, info) {
-                (Either::Left(handler), Either::Left(info)) => {
-                    handler.inject_listen_upgrade_error(info, ConnectionHandlerUpgrErr::Timeout);
-                }
-                (Either::Right(handler), Either::Right(info)) => {
-                    handler.inject_listen_upgrade_error(info, ConnectionHandlerUpgrErr::Timeout);
-                }
-                _ => unreachable!(),
-            },
-            ConnectionHandlerUpgrErr::Upgrade(UpgradeError::Select(error)) => match (self, info) {
-                (Either::Left(handler), Either::Left(info)) => {
-                    handler.inject_listen_upgrade_error(
-                        info,
-                        ConnectionHandlerUpgrErr::Upgrade(UpgradeError::Select(error)),
-                    );
-                }
-                (Either::Right(handler), Either::Right(info)) => {
-                    handler.inject_listen_upgrade_error(
-                        info,
-                        ConnectionHandlerUpgrErr::Upgrade(UpgradeError::Select(error)),
-                    );
-                }
-                _ => unreachable!(),
-            },
-            ConnectionHandlerUpgrErr::Upgrade(UpgradeError::Apply(EitherError::A(e))) => {
-                match (self, info) {
-                    (Either::Left(handler), Either::Left(info)) => {
-                        handler.inject_listen_upgrade_error(
-                            info,
-                            ConnectionHandlerUpgrErr::Upgrade(UpgradeError::Apply(e)),
-                        );
-                    }
-                    _ => unreachable!(),
-                }
-            }
-            ConnectionHandlerUpgrErr::Upgrade(UpgradeError::Apply(EitherError::B(e))) => {
-                match (self, info) {
-                    (Either::Right(handler), Either::Right(info)) => {
-                        handler.inject_listen_upgrade_error(
-                            info,
-                            ConnectionHandlerUpgrErr::Upgrade(UpgradeError::Apply(e)),
-                        );
-                    }
-                    _ => unreachable!(),
-                }
-            }
         }
     }
 
@@ -283,7 +122,7 @@ where
         ConnectionHandlerEvent<
             Self::OutboundProtocol,
             Self::OutboundOpenInfo,
-            Self::OutEvent,
+            Self::ToBehaviour,
             Self::Error,
         >,
     > {
@@ -291,15 +130,100 @@ where
             Either::Left(handler) => futures::ready!(handler.poll(cx))
                 .map_custom(Either::Left)
                 .map_close(Either::Left)
-                .map_protocol(|p| EitherUpgrade::A(SendWrapper(p)))
+                .map_protocol(|p| Either::Left(SendWrapper(p)))
                 .map_outbound_open_info(Either::Left),
             Either::Right(handler) => futures::ready!(handler.poll(cx))
                 .map_custom(Either::Right)
                 .map_close(Either::Right)
-                .map_protocol(|p| EitherUpgrade::B(SendWrapper(p)))
+                .map_protocol(|p| Either::Right(SendWrapper(p)))
                 .map_outbound_open_info(Either::Right),
         };
 
         Poll::Ready(event)
+    }
+
+    fn on_connection_event(
+        &mut self,
+        event: ConnectionEvent<
+            Self::InboundProtocol,
+            Self::OutboundProtocol,
+            Self::InboundOpenInfo,
+            Self::OutboundOpenInfo,
+        >,
+    ) {
+        match event {
+            ConnectionEvent::FullyNegotiatedInbound(fully_negotiated_inbound) => {
+                match (fully_negotiated_inbound.transpose(), self) {
+                    (Either::Left(fully_negotiated_inbound), Either::Left(handler)) => handler
+                        .on_connection_event(ConnectionEvent::FullyNegotiatedInbound(
+                            fully_negotiated_inbound,
+                        )),
+                    (Either::Right(fully_negotiated_inbound), Either::Right(handler)) => handler
+                        .on_connection_event(ConnectionEvent::FullyNegotiatedInbound(
+                            fully_negotiated_inbound,
+                        )),
+                    _ => unreachable!(),
+                }
+            }
+            ConnectionEvent::FullyNegotiatedOutbound(fully_negotiated_outbound) => {
+                match (fully_negotiated_outbound.transpose(), self) {
+                    (Either::Left(fully_negotiated_outbound), Either::Left(handler)) => handler
+                        .on_connection_event(ConnectionEvent::FullyNegotiatedOutbound(
+                            fully_negotiated_outbound,
+                        )),
+                    (Either::Right(fully_negotiated_outbound), Either::Right(handler)) => handler
+                        .on_connection_event(ConnectionEvent::FullyNegotiatedOutbound(
+                            fully_negotiated_outbound,
+                        )),
+                    _ => unreachable!(),
+                }
+            }
+            ConnectionEvent::DialUpgradeError(dial_upgrade_error) => {
+                match (dial_upgrade_error.transpose(), self) {
+                    (Either::Left(dial_upgrade_error), Either::Left(handler)) => handler
+                        .on_connection_event(ConnectionEvent::DialUpgradeError(dial_upgrade_error)),
+                    (Either::Right(dial_upgrade_error), Either::Right(handler)) => handler
+                        .on_connection_event(ConnectionEvent::DialUpgradeError(dial_upgrade_error)),
+                    _ => unreachable!(),
+                }
+            }
+            ConnectionEvent::ListenUpgradeError(listen_upgrade_error) => {
+                match (listen_upgrade_error.transpose(), self) {
+                    (Either::Left(listen_upgrade_error), Either::Left(handler)) => handler
+                        .on_connection_event(ConnectionEvent::ListenUpgradeError(
+                            listen_upgrade_error,
+                        )),
+                    (Either::Right(listen_upgrade_error), Either::Right(handler)) => handler
+                        .on_connection_event(ConnectionEvent::ListenUpgradeError(
+                            listen_upgrade_error,
+                        )),
+                    _ => unreachable!(),
+                }
+            }
+            ConnectionEvent::AddressChange(address_change) => match self {
+                Either::Left(handler) => {
+                    handler.on_connection_event(ConnectionEvent::AddressChange(address_change))
+                }
+                Either::Right(handler) => {
+                    handler.on_connection_event(ConnectionEvent::AddressChange(address_change))
+                }
+            },
+            ConnectionEvent::LocalProtocolsChange(supported_protocols) => match self {
+                Either::Left(handler) => handler.on_connection_event(
+                    ConnectionEvent::LocalProtocolsChange(supported_protocols),
+                ),
+                Either::Right(handler) => handler.on_connection_event(
+                    ConnectionEvent::LocalProtocolsChange(supported_protocols),
+                ),
+            },
+            ConnectionEvent::RemoteProtocolsChange(supported_protocols) => match self {
+                Either::Left(handler) => handler.on_connection_event(
+                    ConnectionEvent::RemoteProtocolsChange(supported_protocols),
+                ),
+                Either::Right(handler) => handler.on_connection_event(
+                    ConnectionEvent::RemoteProtocolsChange(supported_protocols),
+                ),
+            },
+        }
     }
 }

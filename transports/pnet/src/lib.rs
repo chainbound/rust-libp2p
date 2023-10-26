@@ -18,11 +18,14 @@
 // FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 // DEALINGS IN THE SOFTWARE.
 
-//! The `pnet` protocol implements *Pre-shared Key Based Private Networks in libp2p*,
-//! as specified in [the spec](https://github.com/libp2p/specs/blob/master/pnet/Private-Networks-PSK-V1.md)
+//! Implementation of the [pnet](https://github.com/libp2p/specs/blob/master/pnet/Private-Networks-PSK-V1.md) protocol.
 //!
+//| The `pnet` protocol implements *Pre-shared Key Based Private Networks in libp2p*.
 //! Libp2p nodes configured with a pre-shared key can only communicate with other nodes with
 //! the same key.
+
+#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
+
 mod crypt_writer;
 use crypt_writer::CryptWriter;
 use futures::prelude::*;
@@ -99,7 +102,7 @@ fn to_hex(bytes: &[u8]) -> String {
     let mut hex = String::with_capacity(bytes.len() * 2);
 
     for byte in bytes {
-        write!(hex, "{:02x}", byte).expect("Can't fail on writing to string");
+        write!(hex, "{byte:02x}").expect("Can't fail on writing to string");
     }
 
     hex
@@ -171,7 +174,7 @@ pub enum KeyParseError {
 
 impl fmt::Display for KeyParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:?}", self)
+        write!(f, "{self:?}")
     }
 }
 
@@ -214,6 +217,7 @@ impl PnetConfig {
             .write_all(&local_nonce)
             .await
             .map_err(PnetError::HandshakeError)?;
+        socket.flush().await?;
         socket
             .read_exact(&mut remote_nonce)
             .await
@@ -307,8 +311,8 @@ impl fmt::Display for PnetError {
     #[inline]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
         match self {
-            PnetError::HandshakeError(e) => write!(f, "Handshake error: {}", e),
-            PnetError::IoError(e) => write!(f, "I/O error: {}", e),
+            PnetError::HandshakeError(e) => write!(f, "Handshake error: {e}"),
+            PnetError::IoError(e) => write!(f, "I/O error: {e}"),
         }
     }
 }

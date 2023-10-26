@@ -19,11 +19,8 @@
 // DEALINGS IN THE SOFTWARE.
 
 use crate::handler::{
-    ConnectionHandler, ConnectionHandlerEvent, ConnectionHandlerUpgrErr, KeepAlive,
-    SubstreamProtocol,
+    ConnectionEvent, ConnectionHandler, ConnectionHandlerEvent, KeepAlive, SubstreamProtocol,
 };
-use crate::upgrade::{InboundUpgradeSend, OutboundUpgradeSend};
-use libp2p_core::Multiaddr;
 use std::fmt::Debug;
 use std::task::{Context, Poll};
 
@@ -43,12 +40,12 @@ impl<TConnectionHandler, TMap> MapOutEvent<TConnectionHandler, TMap> {
 impl<TConnectionHandler, TMap, TNewOut> ConnectionHandler for MapOutEvent<TConnectionHandler, TMap>
 where
     TConnectionHandler: ConnectionHandler,
-    TMap: FnMut(TConnectionHandler::OutEvent) -> TNewOut,
+    TMap: FnMut(TConnectionHandler::ToBehaviour) -> TNewOut,
     TNewOut: Debug + Send + 'static,
     TMap: Send + 'static,
 {
-    type InEvent = TConnectionHandler::InEvent;
-    type OutEvent = TNewOut;
+    type FromBehaviour = TConnectionHandler::FromBehaviour;
+    type ToBehaviour = TNewOut;
     type Error = TConnectionHandler::Error;
     type InboundProtocol = TConnectionHandler::InboundProtocol;
     type OutboundProtocol = TConnectionHandler::OutboundProtocol;
@@ -59,44 +56,8 @@ where
         self.inner.listen_protocol()
     }
 
-    fn inject_fully_negotiated_inbound(
-        &mut self,
-        protocol: <Self::InboundProtocol as InboundUpgradeSend>::Output,
-        info: Self::InboundOpenInfo,
-    ) {
-        self.inner.inject_fully_negotiated_inbound(protocol, info)
-    }
-
-    fn inject_fully_negotiated_outbound(
-        &mut self,
-        protocol: <Self::OutboundProtocol as OutboundUpgradeSend>::Output,
-        info: Self::OutboundOpenInfo,
-    ) {
-        self.inner.inject_fully_negotiated_outbound(protocol, info)
-    }
-
-    fn inject_event(&mut self, event: Self::InEvent) {
-        self.inner.inject_event(event)
-    }
-
-    fn inject_address_change(&mut self, addr: &Multiaddr) {
-        self.inner.inject_address_change(addr)
-    }
-
-    fn inject_dial_upgrade_error(
-        &mut self,
-        info: Self::OutboundOpenInfo,
-        error: ConnectionHandlerUpgrErr<<Self::OutboundProtocol as OutboundUpgradeSend>::Error>,
-    ) {
-        self.inner.inject_dial_upgrade_error(info, error)
-    }
-
-    fn inject_listen_upgrade_error(
-        &mut self,
-        info: Self::InboundOpenInfo,
-        error: ConnectionHandlerUpgrErr<<Self::InboundProtocol as InboundUpgradeSend>::Error>,
-    ) {
-        self.inner.inject_listen_upgrade_error(info, error)
+    fn on_behaviour_event(&mut self, event: Self::FromBehaviour) {
+        self.inner.on_behaviour_event(event)
     }
 
     fn connection_keep_alive(&self) -> KeepAlive {
@@ -110,16 +71,33 @@ where
         ConnectionHandlerEvent<
             Self::OutboundProtocol,
             Self::OutboundOpenInfo,
-            Self::OutEvent,
+            Self::ToBehaviour,
             Self::Error,
         >,
     > {
         self.inner.poll(cx).map(|ev| match ev {
-            ConnectionHandlerEvent::Custom(ev) => ConnectionHandlerEvent::Custom((self.map)(ev)),
+            ConnectionHandlerEvent::NotifyBehaviour(ev) => {
+                ConnectionHandlerEvent::NotifyBehaviour((self.map)(ev))
+            }
             ConnectionHandlerEvent::Close(err) => ConnectionHandlerEvent::Close(err),
             ConnectionHandlerEvent::OutboundSubstreamRequest { protocol } => {
                 ConnectionHandlerEvent::OutboundSubstreamRequest { protocol }
             }
+            ConnectionHandlerEvent::ReportRemoteProtocols(support) => {
+                ConnectionHandlerEvent::ReportRemoteProtocols(support)
+            }
         })
+    }
+
+    fn on_connection_event(
+        &mut self,
+        event: ConnectionEvent<
+            Self::InboundProtocol,
+            Self::OutboundProtocol,
+            Self::InboundOpenInfo,
+            Self::OutboundOpenInfo,
+        >,
+    ) {
+        self.inner.on_connection_event(event);
     }
 }
