@@ -1,4 +1,64 @@
-## 0.43.0 
+## 0.43.6
+
+- Deprecate `libp2p::swarm::SwarmBuilder`.
+  Most users should use `libp2p::SwarmBuilder`.
+  In some special cases, users may need to use `Swarm::new` and `Config` instead of the new `libp2p::SwarmBuilder`.
+  See [PR 4120].
+- Make the `Debug` implementation of `StreamProtocol` more concise.
+  See [PR 4631](https://github.com/libp2p/rust-libp2p/pull/4631).
+- Fix overflow in `KeepAlive` computation that could occur panic at `Delay::new` if `SwarmBuilder::idle_connection_timeout` is configured too large.
+  See [PR 4644](https://github.com/libp2p/rust-libp2p/pull/4644).
+- Deprecate `KeepAlive::Until`.
+  Individual protocols should not keep connections alive for longer than necessary.
+  Users should use `swarm::Config::idle_connection_timeout` instead.
+  See [PR 4656](https://github.com/libp2p/rust-libp2p/pull/4656).
+- Deprecate `keep_alive_timeout` in `OneShotHandlerConfig`.
+  See [PR 4680](https://github.com/libp2p/rust-libp2p/pull/4680).
+
+[PR 4120]: https://github.com/libp2p/rust-libp2p/pull/4120
+
+## 0.43.5
+
+- Fix overflow in `KeepAlive` computation that could occur if `SwarmBuilder::idle_connection_timeout` is configured with `u64::MAX`.
+  See [PR 4559](https://github.com/libp2p/rust-libp2p/pull/4559).
+
+## 0.43.4
+
+- Implement `Debug` for event structs.
+  See [PR 4426].
+
+- Improve error message when `DialPeerCondition` prevents a dial.
+  See [PR 4409].
+
+- Introduce `SwarmBuilder::idle_conncetion_timeout` and deprecate `keep_alive::Behaviour` as a result.
+  See [PR 4161].
+
+[PR 4426]: https://github.com/libp2p/rust-libp2p/pull/4426
+[PR 4409]: https://github.com/libp2p/rust-libp2p/pull/4409
+[PR 4161]: https://github.com/libp2p/rust-libp2p/pull/4161
+
+## 0.43.3
+
+- Implement `Display` for `ConnectionId`.
+  See [PR 4278].
+
+[PR 4278]: https://github.com/libp2p/rust-libp2p/pull/4278
+
+## 0.43.2
+- Display the cause of a `ListenError::Denied`.
+  See [PR 4232]
+
+[PR 4232]: https://github.com/libp2p/rust-libp2p/pull/4158
+
+## 0.43.1
+
+- Do not announce external address candidate before address translation, unless translation does not apply.
+  This will prevent ephemeral TCP addresses being announced as external address candidates.
+  See [PR 4158].
+
+[PR 4158]: https://github.com/libp2p/rust-libp2p/pull/4158
+
+## 0.43.0
 
 - Allow `NetworkBehaviours` to create and remove listeners.
   See [PR 3292].
