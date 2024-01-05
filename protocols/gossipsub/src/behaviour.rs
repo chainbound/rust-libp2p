@@ -725,6 +725,78 @@ where
         Ok(msg_id)
     }
 
+    /// Publishes a message to our explicit peers.
+    pub fn publish_priority(
+        &mut self,
+        topic: impl Into<TopicHash>,
+        data: impl Into<Vec<u8>>,
+    ) -> Result<MessageId, PublishError> {
+        let data = data.into();
+        let topic = topic.into();
+
+        // Transform the data before building a raw_message.
+        let transformed_data = self
+            .data_transform
+            .outbound_transform(&topic, data.clone())?;
+
+        let raw_message = self.build_raw_message(topic, transformed_data)?;
+
+        // calculate the message id from the un-transformed data
+        let msg_id = self.config.message_id(&Message {
+            source: raw_message.source,
+            data, // the uncompressed form
+            sequence_number: raw_message.sequence_number,
+            topic: raw_message.topic.clone(),
+        });
+
+        // check that the size doesn't exceed the max transmission size
+        if raw_message.raw_protobuf_len() > self.config.max_transmit_size() {
+            return Err(PublishError::MessageTooLarge);
+        }
+
+        // No duplication checks here
+
+        tracing::trace!("Publishing priority message: {:?}", msg_id);
+
+        let topic_hash = raw_message.topic.clone();
+
+        let mut recipient_peers = HashSet::new();
+        if let Some(set) = self.topic_peers.get(&topic_hash) {
+            // Explicit peers
+            for peer in &self.explicit_peers {
+                if set.contains(peer) {
+                    recipient_peers.insert(*peer);
+                }
+            }
+        }
+
+        if recipient_peers.is_empty() {
+            return Err(PublishError::InsufficientPeers);
+        }
+
+        // If the message is anonymous or has a random author add it to the published message ids
+        // cache.
+        if let PublishConfig::RandomAuthor | PublishConfig::Anonymous = self.publish_config {
+            if !self.config.allow_self_origin() {
+                self.published_message_ids.insert(msg_id.clone());
+            }
+        }
+
+        // Send to peers we know are subscribed to the topic.
+        for peer_id in recipient_peers.iter() {
+            tracing::trace!("Sending priority message to peer: {:?}", peer_id);
+            self.send_message(*peer_id, RpcOut::Publish(raw_message.clone()));
+        }
+
+        tracing::debug!(
+            "Published priority message: {:?} to {} peers",
+            &msg_id,
+            recipient_peers.len()
+        );
+
+        Ok(msg_id)
+    }
+
     /// This function should be called when [`Config::validate_messages()`] is `true` after
     /// the message got validated by the caller. Messages are stored in the ['Memcache'] and
     /// validation is expected to be fast enough that the messages should still exist in the cache.
